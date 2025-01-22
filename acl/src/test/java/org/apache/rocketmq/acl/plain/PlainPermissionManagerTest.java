@@ -31,6 +31,7 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
@@ -40,6 +41,11 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class PlainPermissionManagerTest {
 
@@ -376,4 +382,118 @@ public class PlainPermissionManagerTest {
         Assert.assertEquals(true, config.getGlobalWhiteAddrs().contains("192.168.1.2"));
     }
 
+    @Test
+    public void testConcurrentLoadAndSave()  throws Exception {
+        String oldFile = System.getProperty("rocketmq.acl.plain.file", "conf" + File.separator + "plain_acl.yml");
+        String fileName = System.getProperty("rocketmq.home.dir") + File.separator + oldFile;
+        String otherAclDir = System.getProperty("rocketmq.home.dir") + File.separator + "conf" + File.separator + "acl";
+        File transport = new File(fileName);
+        File transportBak = new File(fileName + ".bak");
+        transport.delete();
+        transportBak.delete();
+        transport.createNewFile();
+        File transportOther = new File(otherAclDir + File.separator + "plain_acl.yml");
+        transportOther.delete();
+
+        PlainPermissionManager ppm = new PlainPermissionManager();
+
+        AclConfig acls = ppm.getAllAclConfig();
+        PlainAccessConfig lastAccess = null;
+        int newAdded = 500;
+        ArrayList<PlainAccessResource> allPars = new ArrayList<>();
+        for (int accountIndex = 0; accountIndex < newAdded; accountIndex++) {
+            PlainAccessConfig plainAccess = new PlainAccessConfig();
+            plainAccess.setAccessKey("newaccount" + accountIndex);
+            plainAccess.setSecretKey("newaccountsk" + accountIndex);
+
+            List<String> groupPerms = new ArrayList<>();
+            for (int i = 0; i < 1000; i++) {
+                groupPerms.add("GID_test" + i + "=SUB|PUB");
+            }
+            plainAccess.setGroupPerms(groupPerms);
+            plainAccess.setWhiteRemoteAddress("");
+            plainAccess.setDefaultGroupPerm("PUB|SUB");
+            plainAccess.setDefaultTopicPerm("PUB|SUB");
+            ppm.updateAccessConfig(plainAccess);
+            lastAccess = plainAccess;
+            PlainAccessResource par = ppm.buildPlainAccessResource(plainAccess);
+            par.getResourcePermMap().clear();
+            par.setSignature(AclUtils.calSignature(par.getContent(), plainAccess.getSecretKey()));
+            //ppm.validate(par);
+            allPars.add(par);
+        }
+        // wait watch file load newest
+        Thread.sleep(5 * 1000);
+        for (PlainAccessResource par : allPars) {
+            ppm.validate(par);
+        }
+        List<String> wList = new ArrayList<>();
+        wList.add("127.0.0.1");
+        ppm.updateGlobalWhiteAddrsConfig(wList);
+
+        int oldCnt = acls.getPlainAccessConfigs().size();
+        acls = ppm.getAllAclConfig();
+        Assert.assertEquals(oldCnt + newAdded, acls.getPlainAccessConfigs().size());
+
+        ppm.updateAccessConfig(lastAccess);
+        ppm.load();
+        acls = ppm.getAllAclConfig();
+        Assert.assertEquals(oldCnt + newAdded, acls.getPlainAccessConfigs().size());
+
+        AtomicBoolean isDone = new AtomicBoolean(false);
+        ConcurrentHashMap<String, String> failedResult = new ConcurrentHashMap<>();
+        ConcurrentHashMap<String, String> nofailedResult = new ConcurrentHashMap<>();
+        ScheduledExecutorService loadService = Executors.newSingleThreadScheduledExecutor();
+        loadService.schedule(new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 0; i < 1000; i++) {
+                    try {
+                        ppm.load();
+                    } catch (Exception e) {
+                        failedResult.put("load", e.getMessage());
+                        continue;
+                    }
+                    for (PlainAccessResource par : allPars) {
+                        try {
+                            ppm.validate(par);
+                        } catch (Exception e) {
+                            isDone.set(true);
+                            failedResult.put(par.getAccessKey(), e.getMessage());
+                            return;
+                        }
+                    }
+                }
+                isDone.set(true);
+            }
+        }, 1, TimeUnit.SECONDS);
+        final PlainAccessConfig updateAccess = lastAccess;
+        ScheduledExecutorService updateService = Executors.newSingleThreadScheduledExecutor();
+        updateService.scheduleWithFixedDelay(new Runnable() {
+            @Override
+            public void run() {
+                for (int i = 0; i < 100; i++) {
+                    ppm.updateAccessConfig(updateAccess);
+                    if (isDone.get()) {
+                        return;
+                    }
+                }
+            }
+        }, 900, 1, TimeUnit.MILLISECONDS);
+        
+        for (int i = 0; i < 100; i++) {
+            Thread.sleep(1 * 1000);
+            if (isDone.get()) {
+                break;
+            }
+        }
+
+        loadService.shutdown();
+        updateService.shutdown();
+        loadService.awaitTermination(1, TimeUnit.SECONDS);
+        updateService.awaitTermination(1, TimeUnit.SECONDS);
+        transport.delete();
+        transportBak.delete();
+        Assert.assertEquals("should has not error valid", failedResult, nofailedResult);
+    }
 }

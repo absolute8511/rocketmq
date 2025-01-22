@@ -130,12 +130,13 @@ public class PlainPermissionManager {
 
         for (String path : fileList) {
             final String currentFile = MixAll.dealFilePath(path);
+            log.error("begin load acl {}", currentFile);
             PlainAccessData plainAclConfData = AclUtils.getYamlDataObject(currentFile, PlainAccessData.class);
             if (plainAclConfData == null) {
-                log.warn("No data in file {}", currentFile);
+                log.error("No data in file {}", currentFile);
                 continue;
             }
-            log.info("Broker plain acl conf data is : {}", plainAclConfData.toString());
+            log.error("Broker plain acl conf data is : {}, {}", plainAclConfData, plainAclConfData.getDataVersion());
 
             List<RemoteAddressStrategy> globalWhiteRemoteAddressStrategyList = new ArrayList<>();
             List<String> globalWhiteRemoteAddressesList = plainAclConfData.getGlobalWhiteRemoteAddresses();
@@ -173,11 +174,13 @@ public class PlainPermissionManager {
                 DataVersion firstElement = new DataVersion();
                 firstElement.setCounter(new AtomicLong(dataVersions.get(0).getCounter()));
                 firstElement.setTimestamp(dataVersions.get(0).getTimestamp());
+                log.error("acl conf data version updated : {}", firstElement);
                 dataVersion.assignNewOne(firstElement);
             }
             dataVersionMap.put(currentFile, dataVersion);
         }
 
+        log.error("Broker plain acl load done : {}", aclPlainAccessResourceMap.size());
         if (dataVersionMap.containsKey(defaultAclFile)) {
             this.dataVersion.assignNewOne(dataVersionMap.get(defaultAclFile));
         }
@@ -213,10 +216,10 @@ public class PlainPermissionManager {
         PlainAccessData plainAclConfData = AclUtils.getYamlDataObject(aclFilePath,
             PlainAccessData.class);
         if (plainAclConfData == null) {
-            log.warn("No data in {}, skip it", aclFilePath);
+            log.error("No data in {}, skip it", aclFilePath);
             return;
         }
-        log.info("Broker plain acl conf data is : {}", plainAclConfData.toString());
+        log.error("Broker plain acl conf data is : {}", plainAclConfData.toString());
         List<String> globalWhiteRemoteAddressesList = plainAclConfData.getGlobalWhiteRemoteAddresses();
         if (globalWhiteRemoteAddressesList != null && !globalWhiteRemoteAddressesList.isEmpty()) {
             for (String address : globalWhiteRemoteAddressesList) {
@@ -255,6 +258,7 @@ public class PlainPermissionManager {
             DataVersion firstElement = new DataVersion();
             firstElement.setCounter(new AtomicLong(dataVersions.get(0).getCounter()));
             firstElement.setTimestamp(dataVersions.get(0).getTimestamp());
+            log.error("acl conf data version updated : {}", firstElement);
             dataVersion.assignNewOne(firstElement);
         }
 

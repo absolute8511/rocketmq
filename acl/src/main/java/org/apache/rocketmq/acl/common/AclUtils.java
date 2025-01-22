@@ -30,6 +30,7 @@ import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
 import org.apache.rocketmq.remoting.RPCHook;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
+import org.yaml.snakeyaml.LoaderOptions;
 import org.yaml.snakeyaml.Yaml;
 
 import static org.apache.rocketmq.acl.common.SessionCredentials.CHARSET;
@@ -240,7 +241,9 @@ public class AclUtils {
     }
 
     public static <T> T getYamlDataObject(InputStream fis, Class<T> clazz) {
-        Yaml yaml = new Yaml();
+        LoaderOptions loaderOptions = new LoaderOptions();
+        loaderOptions.setCodePointLimit(1024 * 1024 * 1024);
+        Yaml yaml = new Yaml(loaderOptions);
         try {
             return yaml.loadAs(fis, clazz);
         } catch (Exception e) {
@@ -252,8 +255,10 @@ public class AclUtils {
         Yaml yaml = new Yaml();
         try (PrintWriter pw = new PrintWriter(path, "UTF-8")) {
             String dumpAsMap = yaml.dumpAsMap(dataMap);
+            log.error("=====writeDataObject begin: {}", dumpAsMap.length());
             pw.print(dumpAsMap);
             pw.flush();
+            log.error("=====writeDataObject success");
         } catch (Exception e) {
             throw new AclException(e.getMessage(), e);
         }
