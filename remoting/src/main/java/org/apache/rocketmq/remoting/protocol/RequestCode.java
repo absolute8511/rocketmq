@@ -95,6 +95,7 @@ public class RequestCode {
     public static final int CHANGE_MESSAGE_INVISIBLETIME = 200053;
     public static final int NOTIFICATION = 200054;
     public static final int POLLING_INFO = 200055;
+    public static final int POP_ROLLBACK = 200056;
 
     public static final int PUT_KV_CONFIG = 100;
 
@@ -218,8 +219,10 @@ public class RequestCode {
     public static final int GET_SUBSCRIPTIONGROUP_CONFIG = 352;
     public static final int UPDATE_AND_GET_GROUP_FORBIDDEN = 353;
     public static final int CHECK_ROCKSDB_CQ_WRITE_PROGRESS = 354;
+    public static final int EXPORT_ROCKSDB_CONFIG_TO_JSON = 355;
 
     public static final int LITE_PULL_MESSAGE = 361;
+    public static final int RECALL_MESSAGE = 370;
 
     public static final int QUERY_ASSIGNMENT = 400;
     public static final int SET_MESSAGE_REQUEST_MODE = 401;
