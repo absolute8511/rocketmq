@@ -18,6 +18,7 @@ package org.apache.rocketmq.acl.common;
 
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
 import java.util.Map;
@@ -25,6 +26,7 @@ import java.util.SortedMap;
 
 import com.alibaba.fastjson.JSONObject;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
@@ -231,6 +233,28 @@ public class AclUtils {
     }
 
     public static <T> T getYamlDataObject(String path, Class<T> clazz) {
+        // we only handle not found retry, other exception keep the same
+        T v = getYamlDataObjectNofallback(path, clazz);
+        if (v == null) {
+            log.error("load acl file " + path + " no data, try bak");
+            return getYamlDataObjectNofallback(path + ".bak", clazz);
+        }
+        return v;
+    }
+
+    public static boolean writeDataObject(String path, Object dataMap) {
+        Yaml yaml = new Yaml();
+        String dumpAsMap = yaml.dumpAsMap(dataMap);
+        try {
+            MixAll.string2File(dumpAsMap, path);
+        } catch (IOException e) {
+            log.error("write acl file " + path + " exception", e);
+            throw new AclException(e.getMessage());
+        }
+        return true;
+    }
+
+    public static <T> T getYamlDataObjectNofallback(String path, Class<T> clazz) {
         try (FileInputStream fis = new FileInputStream(path)) {
             return getYamlDataObject(fis, clazz);
         } catch (FileNotFoundException ignore) {
@@ -249,20 +273,6 @@ public class AclUtils {
         } catch (Exception e) {
             throw new AclException(e.getMessage(), e);
         }
-    }
-
-    public static boolean writeDataObject(String path, Object dataMap) {
-        Yaml yaml = new Yaml();
-        try (PrintWriter pw = new PrintWriter(path, "UTF-8")) {
-            String dumpAsMap = yaml.dumpAsMap(dataMap);
-            log.error("=====writeDataObject begin: {}", dumpAsMap.length());
-            pw.print(dumpAsMap);
-            pw.flush();
-            log.error("=====writeDataObject success");
-        } catch (Exception e) {
-            throw new AclException(e.getMessage(), e);
-        }
-        return true;
     }
 
     public static RPCHook getAclRPCHook(String fileName) {

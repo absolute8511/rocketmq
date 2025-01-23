@@ -39,7 +39,6 @@ public class AclFileWatchService extends ServiceThread {
     private final String aclPath;
     private int aclFilesNum;
     @Deprecated
-    private final Map<String, String> fileCurrentHash;
     private Map<String, Long> fileLastModifiedTime;
     private List<String/**absolute pathname **/> fileList = new ArrayList<>();
     private final AclFileWatchService.Listener listener;
@@ -50,7 +49,6 @@ public class AclFileWatchService extends ServiceThread {
     public AclFileWatchService(String path, String defaultAclFile, final AclFileWatchService.Listener listener) throws Exception {
         this.aclPath = path;
         this.defaultAclFile = defaultAclFile;
-        this.fileCurrentHash = new HashMap<>();
         this.fileLastModifiedTime = new HashMap<>();
         this.listener = listener;
 
@@ -110,22 +108,21 @@ public class AclFileWatchService extends ServiceThread {
 
                 if (aclFilesNum != realAclFilesNum) {
                     log.info("aclFilesNum: " + aclFilesNum + "  realAclFilesNum: " + realAclFilesNum);
-                    aclFilesNum = realAclFilesNum;
-                    log.info("aclFilesNum: " + aclFilesNum + "  realAclFilesNum: " + realAclFilesNum);
                     Map<String, Long> fileLastModifiedTime = new HashMap<>(realAclFilesNum);
                     for (int i = 0; i < realAclFilesNum; i++) {
                         String fileAbsolutePath = fileList.get(i);
                         fileLastModifiedTime.put(fileAbsolutePath, new File(fileAbsolutePath).lastModified());
                     }
-                    this.fileLastModifiedTime = fileLastModifiedTime;
                     listener.onFileNumChanged(aclPath);
+                    aclFilesNum = realAclFilesNum;
+                    this.fileLastModifiedTime = fileLastModifiedTime;
                 } else {
                     for (int i = 0; i < aclFilesNum; i++) {
                         String fileName = fileList.get(i);
                         Long newLastModifiedTime = new File(fileName).lastModified();
                         if (!newLastModifiedTime.equals(fileLastModifiedTime.get(fileName))) {
-                            fileLastModifiedTime.put(fileName, newLastModifiedTime);
                             listener.onFileChanged(fileName);
+                            fileLastModifiedTime.put(fileName, newLastModifiedTime);
                         }
                     }
                 }

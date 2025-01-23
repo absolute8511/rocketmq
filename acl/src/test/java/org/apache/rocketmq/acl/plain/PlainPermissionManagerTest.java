@@ -407,7 +407,7 @@ public class PlainPermissionManagerTest {
             plainAccess.setSecretKey("newaccountsk" + accountIndex);
 
             List<String> groupPerms = new ArrayList<>();
-            for (int i = 0; i < 1000; i++) {
+            for (int i = 0; i < 500; i++) {
                 groupPerms.add("GID_test" + i + "=SUB|PUB");
             }
             plainAccess.setGroupPerms(groupPerms);
@@ -423,7 +423,7 @@ public class PlainPermissionManagerTest {
             allPars.add(par);
         }
         // wait watch file load newest
-        Thread.sleep(5 * 1000);
+        Thread.sleep(10 * 1000);
         for (PlainAccessResource par : allPars) {
             ppm.validate(par);
         }
@@ -447,12 +447,13 @@ public class PlainPermissionManagerTest {
         loadService.schedule(new Runnable() {
             @Override
             public void run() {
-                for (int i = 0; i < 1000; i++) {
+                for (int i = 0; i < 3000; i++) {
                     try {
                         ppm.load();
                     } catch (Exception e) {
                         failedResult.put("load", e.getMessage());
-                        continue;
+                        isDone.set(true);
+                        return;
                     }
                     for (PlainAccessResource par : allPars) {
                         try {
@@ -472,7 +473,7 @@ public class PlainPermissionManagerTest {
         updateService.scheduleWithFixedDelay(new Runnable() {
             @Override
             public void run() {
-                for (int i = 0; i < 100; i++) {
+                for (int i = 0; i < 1000; i++) {
                     ppm.updateAccessConfig(updateAccess);
                     if (isDone.get()) {
                         return;

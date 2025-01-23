@@ -54,6 +54,15 @@ public class PlainAccessData implements Serializable {
         this.dataVersion = dataVersion;
     }
 
+    @Override
+    public String toString() {
+        return "PlainAccessData{" +
+                "globalWhiteRemoteAddresses=" + globalWhiteRemoteAddresses +
+                ", accounts=" + accounts +
+                ", dataVersion=" + dataVersion +
+                '}';
+    }
+
     public static class DataVersion implements Serializable {
         private static final long serialVersionUID = 6437361970079056954L;
         private long timestamp;
@@ -75,6 +84,13 @@ public class PlainAccessData implements Serializable {
             this.counter = counter;
         }
 
+        @Override
+        public String toString() {
+            return "DataVersion{" +
+                    "timestamp=" + timestamp +
+                    ", counter=" + counter +
+                    "}";
+        }
         @Override
         public boolean equals(Object o) {
             if (this == o) return true;
