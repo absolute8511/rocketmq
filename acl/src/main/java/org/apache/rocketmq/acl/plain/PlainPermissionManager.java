@@ -205,12 +205,19 @@ public class PlainPermissionManager {
 
         List<PlainAccessConfig> accounts = plainAclConfData.getAccounts();
         Map<String, String> tmpKeyTable = new HashMap<>();
-        tmpKeyTable.putAll(this.accessKeyTable);
+        Set<String> allOldKeysInFile = new HashSet<>();
+        for (Map.Entry<String, String> entry : this.accessKeyTable.entrySet()) {
+            if (entry.getValue().equals(aclFilePath)) {
+                allOldKeysInFile.add(entry.getKey());
+            }
+            tmpKeyTable.put(entry.getKey(), entry.getValue());
+        }
         Map<String, PlainAccessResource> plainAccessResourceMap = new HashMap<>();
         if (accounts != null && !accounts.isEmpty()) {
             for (PlainAccessConfig plainAccessConfig : accounts) {
                 try {
                     PlainAccessResource plainAccessResource = buildPlainAccessResource(plainAccessConfig);
+                    allOldKeysInFile.remove(plainAccessConfig.getAccessKey());
                     // AccessKey can not be defined in multiple ACL files
                     String oldPath = tmpKeyTable.get(plainAccessResource.getAccessKey());
                     if (oldPath == null || aclFilePath.equals(oldPath)) {
@@ -244,8 +251,12 @@ public class PlainPermissionManager {
             }
             this.globalWhiteRemoteAddressStrategyMap.put(aclFilePath, tmpGlobalWhiteRemoteAddressStrategy);
         }
-
-        this.accessKeyTable.putAll(tmpKeyTable);
+        // Delete old keys in this file
+        for (String oldKey : allOldKeysInFile) {
+            log.info("Deleted old not exist key {} in {}", oldKey, aclFilePath);
+            tmpKeyTable.remove(oldKey);
+        }
+        this.accessKeyTable = tmpKeyTable;
         this.aclPlainAccessResourceMap.put(aclFilePath, plainAccessResourceMap);
         this.dataVersionMap.put(aclFilePath, tmpDataVersion);
         if (aclFilePath.equals(defaultAclFile)) {

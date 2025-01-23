@@ -280,7 +280,27 @@ public class PlainPermissionManagerTest {
             Assert.assertNotNull(accessResource);
             Assert.assertEquals(accessResource.getSecretKey(), "88888888");
             Assert.assertFalse(accessResource.isAdmin());
+            accessResource = plainAccessResourceMap.get(aclFileName).get("watchrocketmqx");
+            Assert.assertNull(accessResource);
+            Map<String, String> accessKeyTable1 = (Map<String, String>) FieldUtils.readDeclaredField(plainPermissionManager, "accessKeyTable", true);
+            String aclFileName1 = accessKeyTable1.get("watchrocketmqx");
+            Assert.assertNull(aclFileName1);
 
+        }
+        // test watch delete ak
+        updatedMap = AclUtils.getYamlDataObject(fileName, PlainAccessData.class);
+        accounts = updatedMap.getAccounts();
+        accounts.remove(0);
+        // Update file and flush to yaml file
+        AclUtils.writeDataObject(fileName, updatedMap);
+        Thread.sleep(10000);
+        {
+            Map<String, Map<String, PlainAccessResource>> plainAccessResourceMap = (Map<String, Map<String, PlainAccessResource>>) FieldUtils.readDeclaredField(plainPermissionManager, "aclPlainAccessResourceMap", true);
+            PlainAccessResource accessResource = plainAccessResourceMap.get(aclFileName).get("watchrocketmq1y");
+            Assert.assertNull(accessResource);
+            Map<String, String> accessKeyTable1 = (Map<String, String>) FieldUtils.readDeclaredField(plainPermissionManager, "accessKeyTable", true);
+            String aclFileName1 = accessKeyTable1.get("watchrocketmq1y");
+            Assert.assertNull(aclFileName1);
         }
         transport.delete();
     }
