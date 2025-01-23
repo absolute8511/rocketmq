@@ -20,7 +20,6 @@ import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.PrintWriter;
 import java.util.Map;
 import java.util.SortedMap;
 
@@ -245,6 +244,10 @@ public class AclUtils {
     public static boolean writeDataObject(String path, Object dataMap) {
         Yaml yaml = new Yaml();
         String dumpAsMap = yaml.dumpAsMap(dataMap);
+        return writeString(path, dumpAsMap);
+    }
+
+    public static boolean writeString(String path, String dumpAsMap) {
         try {
             MixAll.string2File(dumpAsMap, path);
         } catch (IOException e) {

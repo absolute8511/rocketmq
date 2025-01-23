@@ -49,7 +49,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class PlainPermissionManagerTest {
 
-    PlainPermissionManager plainPermissionManager;
     PlainAccessResource pubPlainAccessResource;
     PlainAccessResource subPlainAccessResource;
     PlainAccessResource anyPlainAccessResource;
@@ -83,7 +82,7 @@ public class PlainPermissionManagerTest {
         String folder = "conf";
         confHome = AclTestHelper.copyResources(folder, true);
         System.setProperty("rocketmq.home.dir", confHome.getAbsolutePath());
-        plainPermissionManager = new PlainPermissionManager();
+        //plainPermissionManager = new PlainPermissionManager();
     }
 
     public PlainAccessResource clonePlainAccessResource(byte perm) {
@@ -112,6 +111,7 @@ public class PlainPermissionManagerTest {
 
         plainAccess.setAccessKey("RocketMQ");
         plainAccess.setSecretKey("12345678");
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         plainAccessResource = plainPermissionManager.buildPlainAccessResource(plainAccess);
         Assert.assertEquals(plainAccessResource.getAccessKey(), "RocketMQ");
         Assert.assertEquals(plainAccessResource.getSecretKey(), "12345678");
@@ -155,12 +155,14 @@ public class PlainPermissionManagerTest {
     public void checkPermAdmin() {
         PlainAccessResource plainAccessResource = new PlainAccessResource();
         plainAccessResource.setRequestCode(17);
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         plainPermissionManager.checkPerm(plainAccessResource, pubPlainAccessResource);
     }
 
     @Test
     public void checkPerm() {
 
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         PlainAccessResource plainAccessResource = new PlainAccessResource();
         plainAccessResource.addResourceAndPerm("topicA", Permission.PUB);
         plainPermissionManager.checkPerm(plainAccessResource, pubPlainAccessResource);
@@ -178,6 +180,7 @@ public class PlainPermissionManagerTest {
     @Test(expected = AclException.class)
     public void checkErrorPermDefaultValueNotMatch() {
 
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         plainAccessResource = new PlainAccessResource();
         plainAccessResource.addResourceAndPerm("topicF", Permission.PUB);
         plainPermissionManager.checkPerm(plainAccessResource, subPlainAccessResource);
@@ -185,24 +188,28 @@ public class PlainPermissionManagerTest {
 
     @Test(expected = AclException.class)
     public void accountNullTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         plainAccessConfig.setAccessKey(null);
         plainPermissionManager.buildPlainAccessResource(plainAccessConfig);
     }
 
     @Test(expected = AclException.class)
     public void accountThanTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         plainAccessConfig.setAccessKey("123");
         plainPermissionManager.buildPlainAccessResource(plainAccessConfig);
     }
 
     @Test(expected = AclException.class)
     public void passWordtNullTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         plainAccessConfig.setAccessKey(null);
         plainPermissionManager.buildPlainAccessResource(plainAccessConfig);
     }
 
     @Test(expected = AclException.class)
     public void passWordThanTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         plainAccessConfig.setSecretKey("123");
         plainPermissionManager.buildPlainAccessResource(plainAccessConfig);
     }
@@ -210,6 +217,7 @@ public class PlainPermissionManagerTest {
     @SuppressWarnings("unchecked")
     @Test
     public void cleanAuthenticationInfoTest() throws IllegalAccessException {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         // PlainPermissionManager.addPlainAccessResource(plainAccessResource);
         Map<String, Map<String, PlainAccessResource>> plainAccessResourceMap = (Map<String, Map<String, PlainAccessResource>>) FieldUtils.readDeclaredField(plainPermissionManager, "aclPlainAccessResourceMap", true);
         Assert.assertFalse(plainAccessResourceMap.isEmpty());
@@ -279,6 +287,7 @@ public class PlainPermissionManagerTest {
 
     @Test
     public void updateAccessConfigTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         Assert.assertThrows(AclException.class, () -> plainPermissionManager.updateAccessConfig(null));
 
         plainAccessConfig.setAccessKey("admin_test");
@@ -303,6 +312,7 @@ public class PlainPermissionManagerTest {
 
     @Test
     public void getAllAclFilesTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         final List<String> notExistList = plainPermissionManager.getAllAclFiles("aa/bb");
         Assertions.assertThat(notExistList).isEmpty();
         final List<String> files = plainPermissionManager.getAllAclFiles(confHome.getAbsolutePath());
@@ -311,6 +321,7 @@ public class PlainPermissionManagerTest {
 
     @Test
     public void loadTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         plainPermissionManager.load();
         final Map<String, DataVersion> map = plainPermissionManager.getDataVersionMap();
         Assertions.assertThat(map).isNotEmpty();
@@ -318,6 +329,7 @@ public class PlainPermissionManagerTest {
 
     @Test
     public void updateAclConfigFileVersionTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         String aclFileName = "test_plain_acl";
         PlainAccessData updateAclConfigMap = new PlainAccessData();
         List<PlainAccessData.DataVersion> versionElement = new ArrayList<>();
@@ -343,6 +355,7 @@ public class PlainPermissionManagerTest {
         plainAccessConfig.setTopicPerms(Arrays.asList(DEFAULT_TOPIC + "=" + AclConstants.PUB));
         plainAccessConfig.setGroupPerms(Lists.newArrayList("groupA=SUB"));
 
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         final PlainAccessConfig map = plainPermissionManager.createAclAccessConfigMap(existedAccountMap, plainAccessConfig);
         Assert.assertEquals(AclConstants.SUB_PUB, map.getDefaultGroupPerm());
         Assert.assertEquals("groupA=SUB", map.getGroupPerms().get(0));
@@ -356,6 +369,7 @@ public class PlainPermissionManagerTest {
     @Test
     public void deleteAccessConfigTest() throws InterruptedException {
         // delete not exist accessConfig
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         final boolean flag1 = plainPermissionManager.deleteAccessConfig("test_delete");
         assert !flag1;
 
@@ -376,6 +390,7 @@ public class PlainPermissionManagerTest {
 
     @Test
     public void updateGlobalWhiteAddrsConfigTest() {
+        PlainPermissionManager plainPermissionManager = new PlainPermissionManager();
         final boolean flag = plainPermissionManager.updateGlobalWhiteAddrsConfig(Lists.newArrayList("192.168.1.2"));
         assert flag;
         final AclConfig config = plainPermissionManager.getAllAclConfig();
@@ -407,7 +422,7 @@ public class PlainPermissionManagerTest {
             plainAccess.setSecretKey("newaccountsk" + accountIndex);
 
             List<String> groupPerms = new ArrayList<>();
-            for (int i = 0; i < 500; i++) {
+            for (int i = 0; i < 200; i++) {
                 groupPerms.add("GID_test" + i + "=SUB|PUB");
             }
             plainAccess.setGroupPerms(groupPerms);
@@ -447,7 +462,7 @@ public class PlainPermissionManagerTest {
         loadService.schedule(new Runnable() {
             @Override
             public void run() {
-                for (int i = 0; i < 3000; i++) {
+                for (int i = 0; i < 8000; i++) {
                     try {
                         ppm.load();
                     } catch (Exception e) {
@@ -480,9 +495,9 @@ public class PlainPermissionManagerTest {
                     }
                 }
             }
-        }, 900, 1, TimeUnit.MILLISECONDS);
+        }, 0, 1, TimeUnit.MILLISECONDS);
         
-        for (int i = 0; i < 100; i++) {
+        for (int i = 0; i < 50; i++) {
             Thread.sleep(1 * 1000);
             if (isDone.get()) {
                 break;

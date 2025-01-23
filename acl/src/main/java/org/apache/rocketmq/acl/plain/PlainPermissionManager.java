@@ -51,6 +51,7 @@ import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
 import org.apache.rocketmq.remoting.protocol.DataVersion;
 import org.apache.rocketmq.srvutil.AclFileWatchService;
+import org.yaml.snakeyaml.Yaml;
 
 public class PlainPermissionManager {
 
@@ -107,10 +108,12 @@ public class PlainPermissionManager {
     }
 
     private boolean writeAclFile(String path, Object dataMap) {
+        Yaml yaml = new Yaml();
+        String dumpAsMap = yaml.dumpAsMap(dataMap);
         aclFileLock.writeLock().lock();
         try {
             log.info("begin save acl in {}", path);
-            return AclUtils.writeDataObject(path, dataMap);
+            return AclUtils.writeString(path, dumpAsMap);
         } finally {
             aclFileLock.writeLock().unlock();
             log.info("end save acl in {}", path);
@@ -194,7 +197,7 @@ public class PlainPermissionManager {
         } else {
             DataVersion oldVer = this.dataVersionMap.get(aclFilePath);
             if (oldVer != null && oldVer.getCounter().get() > 0) {
-                log.error("acl {} data version missing {}, old {}", aclFilePath, plainAclConfData, oldVer);
+                log.error("acl {} data version missing {}, old {}", aclFilePath, plainAclConfData.getAccounts().size(), oldVer);
                 // the old has version but the new missing, file maybe corrupt
                 throw new AclException("data version missing");
             }
