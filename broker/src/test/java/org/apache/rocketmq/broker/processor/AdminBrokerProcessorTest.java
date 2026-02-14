@@ -75,6 +75,7 @@ import org.apache.rocketmq.remoting.protocol.RequestCode;
 import org.apache.rocketmq.remoting.protocol.ResponseCode;
 import org.apache.rocketmq.remoting.protocol.body.AclInfo;
 import org.apache.rocketmq.remoting.protocol.body.CreateTopicListRequestBody;
+import org.apache.rocketmq.remoting.protocol.body.ConsumerOffsetSerializeWrapper;
 import org.apache.rocketmq.remoting.protocol.body.GroupList;
 import org.apache.rocketmq.remoting.protocol.body.HARuntimeInfo;
 import org.apache.rocketmq.remoting.protocol.body.LockBatchRequestBody;
@@ -315,6 +316,40 @@ public class AdminBrokerProcessorTest {
         RocksDBSubscriptionGroupManager rocksDBSubscriptionGroupManager = new RocksDBSubscriptionGroupManager(brokerController);
         brokerController.setSubscriptionGroupManager(rocksDBSubscriptionGroupManager);
         rocksDBSubscriptionGroupManager.load();
+    }
+
+    @Test
+    public void testGetAllConsumerOffset_UseEncodeByTopicAndSinceWhenHeaderProvided() throws Exception {
+        when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
+
+        RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ALL_CONSUMER_OFFSET, null);
+        request.addExtField("topicList", "TopicA,TopicB");
+        request.addExtField("sinceTimestamp", String.valueOf(123L));
+
+        ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+        wrapper.setOffsetTable(new ConcurrentHashMap<>());
+        when(consumerOffsetManager.encodeByTopicAndSince(anySet(), anyLong())).thenReturn(wrapper);
+
+        RemotingCommand response = adminBrokerProcessor.processRequest(handlerContext, request);
+        assertEquals(ResponseCode.SUCCESS, response.getCode());
+
+        verify(consumerOffsetManager, times(1)).encodeByTopicAndSince(anySet(), anyLong());
+        verify(consumerOffsetManager, times(0)).encode();
+    }
+
+    @Test
+    public void testGetAllConsumerOffset_FallbackToFullEncodeWhenNoHeader() throws Exception {
+        when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
+
+        RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ALL_CONSUMER_OFFSET, null);
+
+        when(consumerOffsetManager.encode()).thenReturn("{}");
+
+        RemotingCommand response = adminBrokerProcessor.processRequest(handlerContext, request);
+        assertEquals(ResponseCode.SUCCESS, response.getCode());
+
+        verify(consumerOffsetManager, times(0)).encodeByTopicAndSince(anySet(), anyLong());
+        verify(consumerOffsetManager, times(1)).encode();
     }
 
     @Test

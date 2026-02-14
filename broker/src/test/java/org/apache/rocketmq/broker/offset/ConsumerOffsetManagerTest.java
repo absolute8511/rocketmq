@@ -146,6 +146,29 @@ public class ConsumerOffsetManagerTest {
     }
 
     @Test
+    public void testEncodeByTopicAndSince_filtersWhenTimestampEqualsSince() {
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
+        offsetsA.put(0, 10L);
+        offsetTable.put("topicA" + TOPIC_GROUP_SEPARATOR + "G1", offsetsA);
+
+        consumerOffsetManager.setOffsetTable(offsetTable);
+
+        long base = System.currentTimeMillis();
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().clear();
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicA", base);
+
+        Set<String> topics = new HashSet<>();
+        topics.add("topicA");
+
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeByTopicAndSince(topics, base);
+        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
+
+        // lastUpdate == sinceTimestamp should also be filtered out
+        assertThat(result).doesNotContainKey("topicA" + TOPIC_GROUP_SEPARATOR + "G1");
+    }
+
+    @Test
     public void testEncodeByTopicAndSince_noTopicsTreatsAsAllTopics() {
         // Build two records that are all recently updated
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();

@@ -142,13 +142,13 @@ public class SlaveSynchronizeTest {
     public void testSyncAll() throws RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException,
         MQBrokerException, InterruptedException, UnsupportedEncodingException, RemotingCommandException {
         TopicConfig newTopicConfig = new TopicConfig("NewTopic");
-        // 让 topicConfigManager 暴露包含 NewTopic 的配置表，便于 syncConsumerOffset 收集到 topics
+        // Make topicConfigManager expose topic table containing NewTopic so syncConsumerOffset can collect topics
         ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
         topicTable.put(newTopicConfig.getTopicName(), newTopicConfig);
         when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
 
         when(brokerOuterAPI.getAllTopicConfig(anyString())).thenReturn(createTopicConfigWrapper(newTopicConfig));
-        // 新实现中，offset 同步走按 topic 增量接口
+        // In new implementation, offset synchronization uses incremental interface by topic
         when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(createConsumerOffsetWrapper());
         when(brokerOuterAPI.getAllDelayOffset(anyString())).thenReturn("");
         when(brokerOuterAPI.getAllSubscriptionGroupConfig(anyString())).thenReturn(createSubscriptionGroupWrapper());
@@ -181,7 +181,7 @@ public class SlaveSynchronizeTest {
 
         when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(wrapper);
 
-        // 仅调用 syncConsumerOffset，避免依赖其它 syncXxx 行为
+        // Invoke only syncConsumerOffset to avoid dependency on other syncXxx behaviors
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
         method.setAccessible(true);
         method.invoke(slaveSynchronize);
@@ -214,7 +214,7 @@ public class SlaveSynchronizeTest {
 
         when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(fullWrapper);
 
-        // 仅调用 syncConsumerOffset，避免依赖其它 syncXxx 行为
+        // Invoke only syncConsumerOffset to avoid dependency on other syncXxx behaviors
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
         method.setAccessible(true);
         method.invoke(slaveSynchronize);
@@ -222,6 +222,87 @@ public class SlaveSynchronizeTest {
         // For old master, should be treated as full snapshot and overwrite local table via setOffsetTable
         verify(consumerOffsetManager, times(1)).setOffsetTable(any(ConcurrentHashMap.class));
         verify(consumerOffsetManager, times(1)).persist();
+    }
+
+    @Test
+    public void testSyncConsumerOffsetUsesLastSyncTimestamp() throws Exception {
+        // Build non-empty topicConfigTable to avoid early return
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put("topicA", new TopicConfig("topicA"));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        // Set lastConsumerOffsetSyncTimestamp to a specific value via reflection
+        long lastSyncTs = 123456L;
+        java.lang.reflect.Field field = SlaveSynchronize.class.getDeclaredField("lastConsumerOffsetSyncTimestamp");
+        field.setAccessible(true);
+        field.setLong(slaveSynchronize, lastSyncTs);
+
+        // Stub offsetWrapper returned by master
+        ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
+        offsets.put(0, 100L);
+        offsetTable.put("topicA@G1", offsets);
+        wrapper.setOffsetTable(offsetTable);
+        wrapper.setDataVersion(new DataVersion());
+
+        when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
+        when(consumerOffsetManager.getOffsetTable()).thenReturn(new ConcurrentHashMap<>());
+
+        org.mockito.ArgumentCaptor<Long> sinceCaptor = org.mockito.ArgumentCaptor.forClass(Long.class);
+        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), sinceCaptor.capture()))
+            .thenReturn(wrapper);
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // Verify sinceTimestamp passed to master equals lastConsumerOffsetSyncTimestamp
+        Assert.assertEquals(lastSyncTs, sinceCaptor.getValue().longValue());
+    }
+
+    @Test
+    public void testSyncConsumerOffsetBatchesTopicsByConfiguredSize() throws Exception {
+        // Build five topics
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        for (int i = 0; i < 5; i++) {
+            topicTable.put("topic" + i, new TopicConfig("topic" + i));
+        }
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        // Set batch size = 2
+        BrokerConfig brokerConfig = brokerController.getBrokerConfig();
+        brokerConfig.setSyncConsumerOffsetBatchTopicNum(2);
+
+        when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
+        when(consumerOffsetManager.getOffsetTable()).thenReturn(new ConcurrentHashMap<>());
+
+        // Stub master to always return offsets that belong to the current batch
+        org.mockito.stubbing.Answer<ConsumerOffsetSerializeWrapper> answer = invocation -> {
+            @SuppressWarnings("unchecked")
+            List<String> batchTopics = (List<String>) invocation.getArgument(1);
+            ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+            ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+            ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
+            offsets.put(0, 100L);
+            if (!batchTopics.isEmpty()) {
+                offsetTable.put(batchTopics.get(0) + "@G1", offsets);
+            }
+            wrapper.setOffsetTable(offsetTable);
+            wrapper.setDataVersion(new DataVersion());
+            return wrapper;
+        };
+
+        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong()))
+            .thenAnswer(answer);
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // For 5 topics and batch size 2, should be invoked 3 times
+        org.mockito.Mockito.verify(brokerOuterAPI, org.mockito.Mockito.times(3))
+            .getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong());
     }
 
     @Test
@@ -249,7 +330,7 @@ public class SlaveSynchronizeTest {
 
     private ConsumerOffsetSerializeWrapper createConsumerOffsetWrapper() {
         ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
-        // 构造一个包含 NewTopic@G1 的最小 offset 快照，便于触发增量同步路径
+        // Build a minimal offset snapshot containing NewTopic@G1 to trigger incremental sync path
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
         ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
         offsets.put(0, 100L);
