@@ -164,6 +164,7 @@ import org.apache.rocketmq.remoting.protocol.header.ExchangeHAInfoResponseHeader
 import org.apache.rocketmq.remoting.protocol.header.ExportRocksDBConfigToJsonRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAclRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAllProducerInfoRequestHeader;
+import org.apache.rocketmq.remoting.protocol.header.GetAllConsumerOffsetRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAllSubscriptionGroupRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAllSubscriptionGroupResponseHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAllTopicConfigRequestHeader;
@@ -1981,7 +1982,33 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
     private RemotingCommand getAllConsumerOffset(ChannelHandlerContext ctx, RemotingCommand request) {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);
 
-        String content = this.brokerController.getConsumerOffsetManager().encode();
+        GetAllConsumerOffsetRequestHeader requestHeader = null;
+        try {
+            if (request.getExtFields() != null && !request.getExtFields().isEmpty()) {
+                requestHeader = (GetAllConsumerOffsetRequestHeader) request.decodeCommandCustomHeader(GetAllConsumerOffsetRequestHeader.class);
+            }
+        } catch (RemotingCommandException e) {
+            LOGGER.warn("decode GetAllConsumerOffsetRequestHeader error, ignore and fallback to full snapshot", e);
+        }
+
+        String content;
+        if (requestHeader != null && (StringUtils.isNotBlank(requestHeader.getTopicList())
+            || requestHeader.getSinceTimestamp() != null && requestHeader.getSinceTimestamp() > 0)) {
+            Set<String> topics = null;
+            if (StringUtils.isNotBlank(requestHeader.getTopicList())) {
+                String[] topicArray = requestHeader.getTopicList().split(",");
+                topics = new HashSet<>(topicArray.length);
+                for (String t : topicArray) {
+                    if (StringUtils.isNotBlank(t)) {
+                        topics.add(t.trim());
+                    }
+                }
+            }
+            long since = requestHeader.getSinceTimestamp() == null ? 0L : requestHeader.getSinceTimestamp();
+            content = RemotingSerializable.toJson(this.brokerController.getConsumerOffsetManager().encodeByTopicAndSince(topics, since), false);
+        } else {
+            content = this.brokerController.getConsumerOffsetManager().encode();
+        }
         if (content != null && content.length() > 0) {
             try {
                 response.setBody(content.getBytes(MixAll.DEFAULT_CHARSET));

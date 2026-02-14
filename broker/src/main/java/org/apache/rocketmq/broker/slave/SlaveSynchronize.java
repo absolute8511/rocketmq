@@ -17,7 +17,9 @@
 package org.apache.rocketmq.broker.slave;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -25,10 +27,12 @@ import java.util.concurrent.ConcurrentMap;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.rocketmq.broker.BrokerController;
 import org.apache.rocketmq.broker.loadbalance.MessageRequestModeManager;
+import org.apache.rocketmq.broker.offset.ConsumerOffsetManager;
 import org.apache.rocketmq.broker.subscription.SubscriptionGroupManager;
 import org.apache.rocketmq.broker.topic.TopicConfigManager;
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.TopicConfig;
+import org.apache.rocketmq.common.lite.LiteUtil;
 import org.apache.rocketmq.common.constant.LoggerName;
 import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
@@ -46,6 +50,13 @@ public class SlaveSynchronize {
     private static final Logger LOGGER = LoggerFactory.getLogger(LoggerName.BROKER_LOGGER_NAME);
     private final BrokerController brokerController;
     private volatile String masterAddr = null;
+
+    /**
+     * Last successful consumer offset sync finish time on this slave.
+     * Used as lower bound when requesting incremental offsets from
+     * master.
+     */
+    private volatile long lastConsumerOffsetSyncTimestamp = 0L;
 
     public SlaveSynchronize(BrokerController brokerController) {
         this.brokerController = brokerController;
@@ -126,19 +137,129 @@ public class SlaveSynchronize {
 
     private void syncConsumerOffset() {
         String masterAddrBak = this.masterAddr;
-        if (masterAddrBak != null && !masterAddrBak.equals(brokerController.getBrokerAddr())) {
-            try {
+        if (masterAddrBak == null || masterAddrBak.equals(brokerController.getBrokerAddr())) {
+            return;
+        }
+
+        try {
+            // Collect all topics known on this broker (after topic config sync).
+            ConcurrentMap<String, TopicConfig> topicConfigTable = this.brokerController.getTopicConfigManager().getTopicConfigTable();
+            if (topicConfigTable == null || topicConfigTable.isEmpty()) {
+                return;
+            }
+
+            List<String> allTopics = new ArrayList<>(topicConfigTable.keySet());
+            int batchSize = this.brokerController.getBrokerConfig().getSyncConsumerOffsetBatchTopicNum();
+            if (batchSize <= 0) {
+                batchSize = 100;
+            }
+
+            long since = this.lastConsumerOffsetSyncTimestamp;
+            ConsumerOffsetManager consumerOffsetManager = this.brokerController.getConsumerOffsetManager();
+
+            for (int i = 0; i < allTopics.size(); i += batchSize) {
+                int end = Math.min(i + batchSize, allTopics.size());
+                List<String> batchTopics = allTopics.subList(i, end);
+
                 ConsumerOffsetSerializeWrapper offsetWrapper =
-                        this.brokerController.getBrokerOuterAPI().getAllConsumerOffset(masterAddrBak);
-                this.brokerController.getConsumerOffsetManager().getOffsetTable()
-                        .putAll(offsetWrapper.getOffsetTable());
-                this.brokerController.getConsumerOffsetManager().getDataVersion().assignNewOne(offsetWrapper.getDataVersion());
-                this.brokerController.getConsumerOffsetManager().persist();
-                LOGGER.info("Update slave consumer offset from master, {}", masterAddrBak);
-            } catch (Exception e) {
-                LOGGER.error("SyncConsumerOffset Exception, {}", masterAddrBak, e);
+                    this.brokerController.getBrokerOuterAPI().getConsumerOffsetByTopicBatch(masterAddrBak, batchTopics, since);
+                if (offsetWrapper == null || offsetWrapper.getOffsetTable() == null || offsetWrapper.getOffsetTable().isEmpty()) {
+                    continue;
+                }
+
+                // Backward compatibility for old masters:
+                // Old masters do not understand topic / time based
+                // incremental parameters and always return the full
+                // offset snapshot. In that case, treating the result
+                // as incremental would still be logically correct but
+                // unnecessarily expensive because we keep merging a
+                // large offset table. Here we check whether the
+                // response contains topics beyond the requested batch
+                // to detect such old masters:
+                // - New master: only returns offsets related to
+                //   requested topics (and their LMQ children).
+                // - Old master: returns offsets for all topics.
+                if (isFullOffsetSnapshotFromOldMaster(offsetWrapper, batchTopics)) {
+                    // Use the full snapshot from master to overwrite
+                    // local offsets once, then stop this sync loop.
+                    consumerOffsetManager.setOffsetTable(new ConcurrentHashMap<>(offsetWrapper.getOffsetTable()));
+                    if (offsetWrapper.getDataVersion() != null) {
+                        consumerOffsetManager.getDataVersion().assignNewOne(offsetWrapper.getDataVersion());
+                    }
+                    break;
+                }
+
+                consumerOffsetManager.getOffsetTable().putAll(offsetWrapper.getOffsetTable());
+                if (offsetWrapper.getDataVersion() != null) {
+                    consumerOffsetManager.getDataVersion().assignNewOne(offsetWrapper.getDataVersion());
+                }
+            }
+
+            consumerOffsetManager.persist();
+            this.lastConsumerOffsetSyncTimestamp = System.currentTimeMillis();
+            LOGGER.info("Update slave consumer offset from master incrementally, master={}, topics={}, sinceTimestamp={}",
+                masterAddrBak, allTopics.size(), since);
+        } catch (Exception e) {
+            LOGGER.error("SyncConsumerOffset Exception, {}", masterAddrBak, e);
+        }
+    }
+
+    /**
+     * Detect whether the given wrapper from master is effectively a
+     * full offset snapshot instead of a topic-filtered one.
+     * <p>
+     * New masters honor {@code topicList} / {@code sinceTimestamp}
+     * and will only return offsets that "belong to" the requested
+     * {@code batchTopics} (including LMQ / lite child topics whose
+     * parent is in the list). Old masters ignore these parameters and
+     * always return the whole offset table. We leverage this
+     * difference to detect old masters and downgrade our behavior.
+     */
+    private boolean isFullOffsetSnapshotFromOldMaster(ConsumerOffsetSerializeWrapper wrapper, List<String> batchTopics) {
+        if (wrapper == null || wrapper.getOffsetTable() == null || wrapper.getOffsetTable().isEmpty()) {
+            return false;
+        }
+        if (batchTopics == null || batchTopics.isEmpty()) {
+            // No topic filter means the caller explicitly asks for a
+            // full snapshot.
+            return true;
+        }
+
+        // Build topic whitelist for this batch.
+        List<String> requestedTopics = new ArrayList<>(batchTopics);
+
+        for (String topicAtGroup : wrapper.getOffsetTable().keySet()) {
+            int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
+            String topic = idx > 0 ? topicAtGroup.substring(0, idx) : topicAtGroup;
+
+            boolean match = false;
+            // Normal topics must appear in batchTopics.
+            if (requestedTopics.contains(topic)) {
+                match = true;
+            } else if (MixAll.isLmq(topic)) {
+                // For LMQ / lite topics, as long as the parent topic
+                // appears in batchTopics, treat it as belonging to
+                // this batch.
+                for (String parent : requestedTopics) {
+                    if (LiteUtil.belongsTo(topic, parent)) {
+                        match = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!match) {
+                // Found a topic that does not belong to this batch,
+                // which implies master did not filter by topic and is
+                // very likely an old version. Treat it as a full
+                // snapshot.
+                return true;
             }
         }
+
+        // All topics are within the batch; treat as incremental
+        // snapshot.
+        return false;
     }
 
     private void syncDelayOffset() {

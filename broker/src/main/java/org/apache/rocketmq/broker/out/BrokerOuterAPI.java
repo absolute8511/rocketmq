@@ -106,6 +106,7 @@ import org.apache.rocketmq.remoting.protocol.body.TopicConfigSerializeWrapper;
 import org.apache.rocketmq.remoting.protocol.body.UnlockBatchRequestBody;
 import org.apache.rocketmq.remoting.protocol.header.ExchangeHAInfoRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.ExchangeHAInfoResponseHeader;
+import org.apache.rocketmq.remoting.protocol.header.GetAllConsumerOffsetRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAllSubscriptionGroupRequestHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAllSubscriptionGroupResponseHeader;
 import org.apache.rocketmq.remoting.protocol.header.GetAllTopicConfigRequestHeader;
@@ -889,6 +890,32 @@ public class BrokerOuterAPI {
         final String addr) throws InterruptedException, RemotingTimeoutException,
         RemotingSendRequestException, RemotingConnectException, MQBrokerException {
         RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ALL_CONSUMER_OFFSET, null);
+        RemotingCommand response = this.remotingClient.invokeSync(addr, request, 3000);
+        assert response != null;
+        switch (response.getCode()) {
+            case ResponseCode.SUCCESS: {
+                return ConsumerOffsetSerializeWrapper.decode(response.getBody(), ConsumerOffsetSerializeWrapper.class);
+            }
+            default:
+                break;
+        }
+
+        throw new MQBrokerException(response.getCode(), response.getRemark(), addr);
+    }
+
+    public ConsumerOffsetSerializeWrapper getConsumerOffsetByTopicBatch(
+        final String addr, final List<String> topics, final long sinceTimestamp) throws InterruptedException,
+        RemotingTimeoutException, RemotingSendRequestException, RemotingConnectException, MQBrokerException {
+
+        GetAllConsumerOffsetRequestHeader requestHeader = new GetAllConsumerOffsetRequestHeader();
+        if (topics != null && !topics.isEmpty()) {
+            requestHeader.setTopicList(String.join(",", topics));
+        }
+        if (sinceTimestamp > 0) {
+            requestHeader.setSinceTimestamp(sinceTimestamp);
+        }
+
+        RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ALL_CONSUMER_OFFSET, requestHeader);
         RemotingCommand response = this.remotingClient.invokeSync(addr, request, 3000);
         assert response != null;
         switch (response.getCode()) {

@@ -16,6 +16,11 @@
  */
 package org.apache.rocketmq.broker.slave;
 
+import java.io.UnsupportedEncodingException;
+import java.lang.reflect.Method;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import org.apache.rocketmq.broker.BrokerController;
 import org.apache.rocketmq.broker.loadbalance.MessageRequestModeManager;
 import org.apache.rocketmq.broker.offset.ConsumerOffsetManager;
@@ -51,10 +56,11 @@ import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.MockitoJUnitRunner;
 
-import java.io.UnsupportedEncodingException;
-import java.util.concurrent.ConcurrentHashMap;
-
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 @RunWith(MockitoJUnitRunner.class)
@@ -136,8 +142,14 @@ public class SlaveSynchronizeTest {
     public void testSyncAll() throws RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException,
         MQBrokerException, InterruptedException, UnsupportedEncodingException, RemotingCommandException {
         TopicConfig newTopicConfig = new TopicConfig("NewTopic");
+        // 让 topicConfigManager 暴露包含 NewTopic 的配置表，便于 syncConsumerOffset 收集到 topics
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put(newTopicConfig.getTopicName(), newTopicConfig);
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
         when(brokerOuterAPI.getAllTopicConfig(anyString())).thenReturn(createTopicConfigWrapper(newTopicConfig));
-        when(brokerOuterAPI.getAllConsumerOffset(anyString())).thenReturn(createConsumerOffsetWrapper());
+        // 新实现中，offset 同步走按 topic 增量接口
+        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(createConsumerOffsetWrapper());
         when(brokerOuterAPI.getAllDelayOffset(anyString())).thenReturn("");
         when(brokerOuterAPI.getAllSubscriptionGroupConfig(anyString())).thenReturn(createSubscriptionGroupWrapper());
         when(brokerOuterAPI.getAllMessageRequestMode(anyString())).thenReturn(createMessageRequestModeWrapper());
@@ -148,6 +160,68 @@ public class SlaveSynchronizeTest {
         Assert.assertEquals(1, consumerOffsetManager.getDataVersion().getStateVersion());
         Assert.assertEquals(1, subscriptionGroupManager.getDataVersion().getStateVersion());
         Assert.assertEquals(1, timerMetrics.getDataVersion().getStateVersion());
+    }
+
+    @Test
+    public void testSyncConsumerOffsetIncrementalWithNewMaster() throws Exception {
+        // Build topic config table on broker side
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put("topicA", new TopicConfig("topicA"));
+        topicTable.put("topicB", new TopicConfig("topicB"));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        // New master returns incremental result filtered by topics, only topicA
+        ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
+        offsets.put(0, 100L);
+        offsetTable.put("topicA@G1", offsets);
+        wrapper.setOffsetTable(offsetTable);
+        wrapper.setDataVersion(new DataVersion());
+
+        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(wrapper);
+
+        // 仅调用 syncConsumerOffset，避免依赖其它 syncXxx 行为
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // For new master, offsets should be merged incrementally into local table
+        verify(consumerOffsetManager, times(1)).getOffsetTable();
+        verify(consumerOffsetManager, times(1)).persist();
+    }
+
+    @Test
+    public void testSyncConsumerOffsetFallbackToFullSnapshotWithOldMaster() throws Exception {
+        // Build topic config table on broker side, only topicA
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put("topicA", new TopicConfig("topicA"));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        // Old master returns a full snapshot containing topicA and topicX
+        ConsumerOffsetSerializeWrapper fullWrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> fullOffsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
+        offsetsA.put(0, 100L);
+        fullOffsetTable.put("topicA@G1", offsetsA);
+        ConcurrentMap<Integer, Long> offsetsX = new ConcurrentHashMap<>();
+        offsetsX.put(0, 200L);
+        fullOffsetTable.put("topicX@G2", offsetsX);
+        fullWrapper.setOffsetTable(fullOffsetTable);
+        DataVersion dataVersion = new DataVersion();
+        dataVersion.setStateVersion(2L);
+        fullWrapper.setDataVersion(dataVersion);
+
+        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(fullWrapper);
+
+        // 仅调用 syncConsumerOffset，避免依赖其它 syncXxx 行为
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // For old master, should be treated as full snapshot and overwrite local table via setOffsetTable
+        verify(consumerOffsetManager, times(1)).setOffsetTable(any(ConcurrentHashMap.class));
+        verify(consumerOffsetManager, times(1)).persist();
     }
 
     @Test
@@ -175,7 +249,12 @@ public class SlaveSynchronizeTest {
 
     private ConsumerOffsetSerializeWrapper createConsumerOffsetWrapper() {
         ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
-        wrapper.setOffsetTable(new ConcurrentHashMap<>());
+        // 构造一个包含 NewTopic@G1 的最小 offset 快照，便于触发增量同步路径
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
+        offsets.put(0, 100L);
+        offsetTable.put("NewTopic@G1", offsets);
+        wrapper.setOffsetTable(offsetTable);
         DataVersion dataVersion = new DataVersion();
         dataVersion.setStateVersion(1L);
         wrapper.setDataVersion(dataVersion);

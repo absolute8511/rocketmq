@@ -17,15 +17,18 @@
 
 package org.apache.rocketmq.broker.offset;
 
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import org.apache.rocketmq.broker.BrokerController;
 import org.apache.rocketmq.common.BrokerConfig;
+import org.apache.rocketmq.remoting.protocol.body.ConsumerOffsetSerializeWrapper;
 import org.apache.rocketmq.store.config.MessageStoreConfig;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
-
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import org.mockito.Mockito;
 
 import static org.apache.rocketmq.broker.offset.ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR;
@@ -99,5 +102,69 @@ public class ConsumerOffsetManagerTest {
 
         ConcurrentMap<Integer, Long> offsetTableLoaded = manager.getOffsetTable().get(group);
         Assert.assertEquals(table, offsetTableLoaded);
+    }
+
+    @Test
+    public void testEncodeByTopicAndSince_filtersByTopicsAndTimestamp() {
+        // Prepare offsetTable: topicA@G1, topicB@G1, topicC@G2
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
+        offsetsA.put(0, 10L);
+        offsetTable.put("topicA" + TOPIC_GROUP_SEPARATOR + "G1", offsetsA);
+
+        ConcurrentMap<Integer, Long> offsetsB = new ConcurrentHashMap<>();
+        offsetsB.put(0, 20L);
+        offsetTable.put("topicB" + TOPIC_GROUP_SEPARATOR + "G1", offsetsB);
+
+        ConcurrentMap<Integer, Long> offsetsC = new ConcurrentHashMap<>();
+        offsetsC.put(0, 30L);
+        offsetTable.put("topicC" + TOPIC_GROUP_SEPARATOR + "G2", offsetsC);
+
+        consumerOffsetManager.setOffsetTable(offsetTable);
+
+        // Simulate timestamps: topicA earlier, topicB newer, topicC without timestamp
+        long base = System.currentTimeMillis();
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().clear();
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicA", base - 10_000);
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicB", base);
+
+        // Only request topicA/B, sinceTimestamp between their timestamps
+        Set<String> topics = new HashSet<>();
+        topics.add("topicA");
+        topics.add("topicB");
+        long since = base - 5_000;
+
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeByTopicAndSince(topics, since);
+        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
+
+        // topicA last update is earlier than since, should be filtered
+        assertThat(result).doesNotContainKey("topicA" + TOPIC_GROUP_SEPARATOR + "G1");
+        // topicB matches topic and timestamp constraints, should be kept
+        assertThat(result).containsKey("topicB" + TOPIC_GROUP_SEPARATOR + "G1");
+        // topicC is not in whitelist, should be filtered
+        assertThat(result).doesNotContainKey("topicC" + TOPIC_GROUP_SEPARATOR + "G2");
+    }
+
+    @Test
+    public void testEncodeByTopicAndSince_noTopicsTreatsAsAllTopics() {
+        // Build two records that are all recently updated
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
+        offsetsA.put(0, 10L);
+        offsetTable.put("topicA" + TOPIC_GROUP_SEPARATOR + "G1", offsetsA);
+
+        ConcurrentMap<Integer, Long> offsetsB = new ConcurrentHashMap<>();
+        offsetsB.put(0, 20L);
+        offsetTable.put("topicB" + TOPIC_GROUP_SEPARATOR + "G2", offsetsB);
+        consumerOffsetManager.setOffsetTable(offsetTable);
+
+        long now = System.currentTimeMillis();
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().clear();
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicA", now);
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicB", now);
+
+        // topics is null and sinceTimestamp<=0, treat as full snapshot
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeByTopicAndSince(null, 0);
+        assertThat(wrapper.getOffsetTable()).hasSize(2);
     }
 }

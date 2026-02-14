@@ -352,6 +352,14 @@ public class BrokerConfig extends BrokerIdentity {
     private long delayOffsetUpdateVersionStep = 200;
 
     /**
+     * Max topic count in a single consumer offset sync batch between
+     * slave and master. This is mainly used to avoid a single
+     * GET_ALL_CONSUMER_OFFSET response becoming too large when there
+     * are a lot of topics.
+     */
+    private int syncConsumerOffsetBatchTopicNum = 100;
+
+    /**
      * Whether to lock quorum replicas.
      *
      * True: need to lock quorum replicas succeed. False: only need to lock one replica succeed.
@@ -1583,6 +1591,14 @@ public class BrokerConfig extends BrokerIdentity {
 
     public void setConsumerOffsetUpdateVersionStep(long consumerOffsetUpdateVersionStep) {
         this.consumerOffsetUpdateVersionStep = consumerOffsetUpdateVersionStep;
+    }
+
+    public int getSyncConsumerOffsetBatchTopicNum() {
+        return syncConsumerOffsetBatchTopicNum;
+    }
+
+    public void setSyncConsumerOffsetBatchTopicNum(int syncConsumerOffsetBatchTopicNum) {
+        this.syncConsumerOffsetBatchTopicNum = syncConsumerOffsetBatchTopicNum;
     }
 
     public long getDelayOffsetUpdateVersionStep() {
