@@ -190,4 +190,35 @@ public class ConsumerOffsetManagerTest {
         ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeByTopicAndSince(null, 0);
         assertThat(wrapper.getOffsetTable()).hasSize(2);
     }
+
+    @Test
+    public void testEncodeByTopicAndSince_filtersLiteTopicByParentTimestamp() {
+        // Build a lite topic (backed by LMQ) whose parent topic is parentTopic
+        String parentTopic = "parentTopic";
+        String liteTopic = "%LMQ%$" + parentTopic + "$child";
+
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsetsLite = new ConcurrentHashMap<>();
+        offsetsLite.put(0, 10L);
+        offsetTable.put(liteTopic + TOPIC_GROUP_SEPARATOR + "G1", offsetsLite);
+
+        consumerOffsetManager.setOffsetTable(offsetTable);
+
+        long base = System.currentTimeMillis();
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().clear();
+        // Only record last update timestamp for parent topic
+        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put(parentTopic, base);
+
+        // 1) since < parent last update timestamp, lite topic should be kept
+        ConsumerOffsetSerializeWrapper wrapper1 = consumerOffsetManager.encodeByTopicAndSince(
+            new HashSet<String>() {{ add(parentTopic); }}, base - 1_000);
+        Map<String, ConcurrentMap<Integer, Long>> result1 = wrapper1.getOffsetTable();
+        assertThat(result1).containsKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
+
+        // 2) since >= parent last update timestamp, lite topic should be filtered out
+        ConsumerOffsetSerializeWrapper wrapper2 = consumerOffsetManager.encodeByTopicAndSince(
+            new HashSet<String>() {{ add(parentTopic); }}, base);
+        Map<String, ConcurrentMap<Integer, Long>> result2 = wrapper2.getOffsetTable();
+        assertThat(result2).doesNotContainKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
+    }
 }

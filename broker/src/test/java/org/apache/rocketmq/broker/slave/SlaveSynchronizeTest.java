@@ -231,6 +231,10 @@ public class SlaveSynchronizeTest {
         topicTable.put("topicA", new TopicConfig("topicA"));
         when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
 
+        // Disable safe gap so that sinceTimestamp equals lastConsumerOffsetSyncTimestamp
+        BrokerConfig brokerConfig = brokerController.getBrokerConfig();
+        brokerConfig.setSyncConsumerOffsetSafeGapMillis(0);
+
         // Set lastConsumerOffsetSyncTimestamp to a specific value via reflection
         long lastSyncTs = 123456L;
         java.lang.reflect.Field field = SlaveSynchronize.class.getDeclaredField("lastConsumerOffsetSyncTimestamp");
@@ -259,6 +263,48 @@ public class SlaveSynchronizeTest {
 
         // Verify sinceTimestamp passed to master equals lastConsumerOffsetSyncTimestamp
         Assert.assertEquals(lastSyncTs, sinceCaptor.getValue().longValue());
+    }
+
+    @Test
+    public void testSyncConsumerOffsetAppliesSafeGap() throws Exception {
+        // Build non-empty topicConfigTable to avoid early return
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put("topicA", new TopicConfig("topicA"));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        // Configure a non-zero safe gap
+        BrokerConfig brokerConfig = brokerController.getBrokerConfig();
+        long safeGap = 5000L;
+        brokerConfig.setSyncConsumerOffsetSafeGapMillis(safeGap);
+
+        // Set lastConsumerOffsetSyncTimestamp to a specific value via reflection
+        long lastSyncTs = 20_000L;
+        java.lang.reflect.Field field = SlaveSynchronize.class.getDeclaredField("lastConsumerOffsetSyncTimestamp");
+        field.setAccessible(true);
+        field.setLong(slaveSynchronize, lastSyncTs);
+
+        // Stub offsetWrapper returned by master
+        ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
+        offsets.put(0, 100L);
+        offsetTable.put("topicA@G1", offsets);
+        wrapper.setOffsetTable(offsetTable);
+        wrapper.setDataVersion(new DataVersion());
+
+        when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
+        when(consumerOffsetManager.getOffsetTable()).thenReturn(new ConcurrentHashMap<>());
+
+        org.mockito.ArgumentCaptor<Long> sinceCaptor = org.mockito.ArgumentCaptor.forClass(Long.class);
+        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), sinceCaptor.capture()))
+            .thenReturn(wrapper);
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        long expectedSince = lastSyncTs - safeGap;
+        Assert.assertEquals(expectedSince, sinceCaptor.getValue().longValue());
     }
 
     @Test

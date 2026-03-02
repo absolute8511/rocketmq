@@ -373,13 +373,12 @@ public class ConsumerOffsetManager extends ConfigManager {
             if (topics != null && !topics.isEmpty()) {
                 boolean match = false;
                 if (!MixAll.isLmq(topic)) {
-                    // Normal topics: match by topic name directly
+                    // Normal topic: match by topic name directly
                     match = topics.contains(topic);
                 } else {
-                    // LMQ / lite topics: filter by parent topic
+                    // LMQ / lite topic: use parent topic as matching granularity
                     if (topics.contains(topic)) {
-                        // Compatibility: if whitelist already contains
-                        // this LMQ name, treat it as matched as well.
+                        // Compatibility: whitelist already contains this LMQ name
                         match = true;
                     } else {
                         for (String parentTopic : topics) {
@@ -396,11 +395,23 @@ public class ConsumerOffsetManager extends ConfigManager {
                 }
             }
 
+            // Time filtering: keep consistent with how timestamps are recorded in commitOffset
+            // - Normal topic: filter by topic itself
+            // - LMQ / lite topic: filter by parent topic
             if (sinceTimestamp > 0) {
-                Long lastUpdate = this.topicOffsetUpdateTimestampTable.get(topic);
-                // If we have a recorded timestamp and it is not newer than sinceTimestamp,
+                String topicForTimestamp = topic;
+                if (MixAll.isLmq(topic)) {
+                    String parentTopic = LiteUtil.getParentTopic(topic);
+                    if (parentTopic != null) {
+                        topicForTimestamp = parentTopic;
+                    }
+                }
+
+                Long lastUpdate = this.topicOffsetUpdateTimestampTable.get(topicForTimestamp);
+                // If we have a recorded timestamp that is not newer than sinceTimestamp,
                 // we can safely skip all offsets under this topic. For topics without
-                // timestamp, keep them to avoid missing offsets after broker restart.
+                // a recorded timestamp (for example, old data reloaded after restart),
+                // keep them to avoid missing any updates.
                 if (lastUpdate != null && lastUpdate <= sinceTimestamp) {
                     continue;
                 }

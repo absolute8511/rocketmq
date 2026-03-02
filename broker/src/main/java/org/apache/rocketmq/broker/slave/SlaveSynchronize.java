@@ -142,6 +142,14 @@ public class SlaveSynchronize {
         }
 
         try {
+            // Record the start time of this sync round. We use this
+            // as the upper bound watermark for the next incremental
+            // window so that updates happening after the snapshot is
+            // fetched but before this method returns will still be
+            // included in the next sync, without requiring an
+            // excessively large safety gap.
+            long syncStartTime = System.currentTimeMillis();
+
             // Collect all topics known on this broker (after topic config sync).
             ConcurrentMap<String, TopicConfig> topicConfigTable = this.brokerController.getTopicConfigManager().getTopicConfigTable();
             if (topicConfigTable == null || topicConfigTable.isEmpty()) {
@@ -154,7 +162,18 @@ public class SlaveSynchronize {
                 batchSize = 100;
             }
 
-            long since = this.lastConsumerOffsetSyncTimestamp;
+            long sinceBase = this.lastConsumerOffsetSyncTimestamp;
+            long safeGap = this.brokerController.getBrokerConfig().getSyncConsumerOffsetSafeGapMillis();
+            if (safeGap < 0) {
+                safeGap = 0;
+            }
+            // Apply a small overlap window on time-based incremental
+            // sync to avoid missing updates around the boundary due
+            // to network delay or clock skew between master and
+            // slave. The trade-off is that a small portion of offsets
+            // might be fetched more than once, which is acceptable
+            // for this idempotent merge behavior.
+            long since = sinceBase > safeGap ? sinceBase - safeGap : 0L;
             ConsumerOffsetManager consumerOffsetManager = this.brokerController.getConsumerOffsetManager();
 
             for (int i = 0; i < allTopics.size(); i += batchSize) {
@@ -196,9 +215,14 @@ public class SlaveSynchronize {
             }
 
             consumerOffsetManager.persist();
-            this.lastConsumerOffsetSyncTimestamp = System.currentTimeMillis();
-            LOGGER.info("Update slave consumer offset from master incrementally, master={}, topics={}, sinceTimestamp={}",
-                masterAddrBak, allTopics.size(), since);
+            // Use the start time of this sync as the new watermark so
+            // that the time-based incremental window does not rely on
+            // the total duration of this method. Combined with the
+            // safety gap, this avoids missing updates that happened
+            // while this sync was in progress.
+            this.lastConsumerOffsetSyncTimestamp = syncStartTime;
+            LOGGER.info("Update slave consumer offset from master incrementally, master={}, topics={}, sinceTimestamp={}, safeGapMillis={}, baseTimestamp={}",
+                masterAddrBak, allTopics.size(), since, safeGap, sinceBase);
         } catch (Exception e) {
             LOGGER.error("SyncConsumerOffset Exception, {}", masterAddrBak, e);
         }

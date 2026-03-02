@@ -360,6 +360,21 @@ public class BrokerConfig extends BrokerIdentity {
     private int syncConsumerOffsetBatchTopicNum = 100;
 
     /**
+     * Safety time gap (in milliseconds) applied when issuing
+     * incremental consumer offset sync requests from slave to master.
+     * <p>
+     * The slave subtracts this gap from the last successful
+     * {@code lastConsumerOffsetSyncTimestamp} when constructing the
+     * {@code sinceTimestamp} parameter so that two consecutive
+     * incremental windows overlap slightly. This overlap helps avoid
+     * missing offsets that are updated around the boundary due to
+     * network latency, scheduling jitter or clock skew between master
+     * and slave, at the cost of potentially fetching a small number of
+     * duplicate records.
+     */
+    private long syncConsumerOffsetSafeGapMillis = 5000;
+
+    /**
      * Whether to lock quorum replicas.
      *
      * True: need to lock quorum replicas succeed. False: only need to lock one replica succeed.
@@ -1599,6 +1614,14 @@ public class BrokerConfig extends BrokerIdentity {
 
     public void setSyncConsumerOffsetBatchTopicNum(int syncConsumerOffsetBatchTopicNum) {
         this.syncConsumerOffsetBatchTopicNum = syncConsumerOffsetBatchTopicNum;
+    }
+
+    public long getSyncConsumerOffsetSafeGapMillis() {
+        return syncConsumerOffsetSafeGapMillis;
+    }
+
+    public void setSyncConsumerOffsetSafeGapMillis(long syncConsumerOffsetSafeGapMillis) {
+        this.syncConsumerOffsetSafeGapMillis = syncConsumerOffsetSafeGapMillis;
     }
 
     public long getDelayOffsetUpdateVersionStep() {
