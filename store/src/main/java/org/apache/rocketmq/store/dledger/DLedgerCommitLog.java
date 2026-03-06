@@ -47,12 +47,14 @@ import org.apache.rocketmq.store.AppendMessageStatus;
 import org.apache.rocketmq.store.CommitLog;
 import org.apache.rocketmq.store.DefaultMessageStore;
 import org.apache.rocketmq.store.DispatchRequest;
+import org.apache.rocketmq.store.LmqDispatch;
 import org.apache.rocketmq.store.MessageExtEncoder;
 import org.apache.rocketmq.store.PutMessageResult;
 import org.apache.rocketmq.store.PutMessageStatus;
 import org.apache.rocketmq.store.SelectMappedBufferResult;
 import org.apache.rocketmq.store.StoreStatsService;
 import org.apache.rocketmq.store.config.MessageStoreConfig;
+import org.apache.rocketmq.store.exception.ConsumeQueueException;
 import org.apache.rocketmq.store.logfile.MappedFile;
 import org.rocksdb.RocksDBException;
 
@@ -553,6 +555,24 @@ public class DLedgerCommitLog extends CommitLog {
             msg.setVersion(MessageVersion.MESSAGE_VERSION_V2);
         }
 
+        final boolean isMultiDispatchMsg = this.defaultMessageStore.getMessageStoreConfig().isEnableLmq()
+            && msg.needDispatchLMQ();
+
+        if (isMultiDispatchMsg) {
+            try {
+                LmqDispatch.wrapLmqDispatch(this.defaultMessageStore, msg);
+            } catch (ConsumeQueueException e) {
+                if (e.getCause() instanceof RocksDBException) {
+                    log.error("Failed to wrap multi-dispatch in DLedgerCommitLog", e);
+                    AppendMessageResult errorResult = new AppendMessageResult(AppendMessageStatus.ROCKSDB_ERROR);
+                    return CompletableFuture.completedFuture(new PutMessageResult(PutMessageStatus.UNKNOWN_ERROR, errorResult));
+                }
+                log.error("Failed to wrap multi-dispatch in DLedgerCommitLog", e);
+                AppendMessageResult errorResult = new AppendMessageResult(AppendMessageStatus.UNKNOWN_ERROR);
+                return CompletableFuture.completedFuture(new PutMessageResult(PutMessageStatus.UNKNOWN_ERROR, errorResult));
+            }
+        }
+
         // Back to Results
         AppendMessageResult appendResult;
         AppendFuture<AppendEntryResponse> dledgerFuture;
@@ -598,6 +618,21 @@ public class DLedgerCommitLog extends CommitLog {
 
             if (elapsedTimeInLock > 500) {
                 log.warn("[NOTIFYME]putMessage in lock cost time(ms)={}, bodyLength={} AppendMessageResult={}", elapsedTimeInLock, msg.getBody().length, appendResult);
+            }
+
+            if (isMultiDispatchMsg) {
+                try {
+                    LmqDispatch.updateLmqOffsets(this.defaultMessageStore, msg);
+                } catch (ConsumeQueueException e) {
+                    if (e.getCause() instanceof RocksDBException) {
+                        log.error("Failed to update multi-dispatch offsets in DLedgerCommitLog", e);
+                        return CompletableFuture.completedFuture(new PutMessageResult(PutMessageStatus.UNKNOWN_ERROR,
+                            new AppendMessageResult(AppendMessageStatus.ROCKSDB_ERROR)));
+                    }
+                    log.error("Failed to update multi-dispatch offsets in DLedgerCommitLog", e);
+                    return CompletableFuture.completedFuture(new PutMessageResult(PutMessageStatus.UNKNOWN_ERROR,
+                        new AppendMessageResult(AppendMessageStatus.UNKNOWN_ERROR)));
+                }
             }
 
             defaultMessageStore.increaseOffset(msg, getMessageNum(msg));
