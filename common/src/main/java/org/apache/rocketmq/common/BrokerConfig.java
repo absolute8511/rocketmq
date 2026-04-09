@@ -375,6 +375,21 @@ public class BrokerConfig extends BrokerIdentity {
     private long syncConsumerOffsetSafeGapMillis = 5000;
 
     /**
+     * Whether slave should also proactively clean consumer offsets
+     * for subscription groups that have been deleted on master when
+     * performing consumer offset synchronization.
+     * <p>
+     * When this flag is true, after syncing consumer offsets from
+     * master, slave will remove local offsets whose consumer groups no
+     * longer exist in the subscription group configuration received
+     * from master. When false, slave will keep those offsets even if
+     * the corresponding groups have been deleted on master, so that
+     * the behavior keeps consistent with deleteSubscriptionGroup
+     * requests that choose to retain offsets.
+     */
+    private boolean cleanDeletedSubscriptionGroupOffsetInSlave = false;
+
+    /**
      * Whether to lock quorum replicas.
      *
      * True: need to lock quorum replicas succeed. False: only need to lock one replica succeed.
@@ -1622,6 +1637,14 @@ public class BrokerConfig extends BrokerIdentity {
 
     public void setSyncConsumerOffsetSafeGapMillis(long syncConsumerOffsetSafeGapMillis) {
         this.syncConsumerOffsetSafeGapMillis = syncConsumerOffsetSafeGapMillis;
+    }
+
+    public boolean isCleanDeletedSubscriptionGroupOffsetInSlave() {
+        return cleanDeletedSubscriptionGroupOffsetInSlave;
+    }
+
+    public void setCleanDeletedSubscriptionGroupOffsetInSlave(boolean cleanDeletedSubscriptionGroupOffsetInSlave) {
+        this.cleanDeletedSubscriptionGroupOffsetInSlave = cleanDeletedSubscriptionGroupOffsetInSlave;
     }
 
     public long getDelayOffsetUpdateVersionStep() {

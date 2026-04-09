@@ -18,9 +18,12 @@ package org.apache.rocketmq.broker.slave;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 
@@ -57,6 +60,17 @@ public class SlaveSynchronize {
      * master.
      */
     private volatile long lastConsumerOffsetSyncTimestamp = 0L;
+
+    /**
+     * Groups that had consumer offsets returned by master in the last
+     * successful {@link #syncConsumerOffset()} round. When cleaning
+     * offsets for deleted subscription groups on slave, we use this as
+     * a soft guardrail: if a group still appeared in the most recent
+     * offset sync result from master, we skip removing its local
+     * offsets for now to avoid prematurely dropping offsets that are
+     * still present on master.
+     */
+    private volatile Set<String> lastSyncedConsumerOffsetGroups = Collections.emptySet();
 
     public SlaveSynchronize(BrokerController brokerController) {
         this.brokerController = brokerController;
@@ -175,6 +189,10 @@ public class SlaveSynchronize {
             // for this idempotent merge behavior.
             long since = sinceBase > safeGap ? sinceBase - safeGap : 0L;
             ConsumerOffsetManager consumerOffsetManager = this.brokerController.getConsumerOffsetManager();
+            // Track groups that have offsets returned by master in
+            // this sync round, for use as a best-effort guard when
+            // cleaning group offsets on slave.
+            Set<String> syncedGroupsThisRound = new HashSet<>();
 
             for (int i = 0; i < allTopics.size(); i += batchSize) {
                 int end = Math.min(i + batchSize, allTopics.size());
@@ -185,6 +203,8 @@ public class SlaveSynchronize {
                 if (offsetWrapper == null || offsetWrapper.getOffsetTable() == null || offsetWrapper.getOffsetTable().isEmpty()) {
                     continue;
                 }
+
+                collectOffsetGroupsFromWrapper(offsetWrapper, syncedGroupsThisRound);
 
                 // Backward compatibility for old masters:
                 // Old masters do not understand topic / time based
@@ -213,6 +233,16 @@ public class SlaveSynchronize {
                     consumerOffsetManager.getDataVersion().assignNewOne(offsetWrapper.getDataVersion());
                 }
             }
+
+            // After merging incremental offsets from master, we need to
+            // clean up local offsets whose topics have been deleted on
+            // this broker. Topics that still exist but simply have no
+            // recent updates must be kept.
+            cleanupOrphanConsumerOffsets(consumerOffsetManager, topicConfigTable);
+
+            // Update guardrail view for subscription-group cleanup to
+            // reflect what master returned in this sync round.
+            this.lastSyncedConsumerOffsetGroups = syncedGroupsThisRound;
 
             consumerOffsetManager.persist();
             // Use the start time of this sync as the new watermark so
@@ -286,6 +316,82 @@ public class SlaveSynchronize {
         return false;
     }
 
+    private void collectOffsetGroupsFromWrapper(ConsumerOffsetSerializeWrapper wrapper, Set<String> groups) {
+        if (wrapper == null || groups == null) {
+            return;
+        }
+        Map<String, ConcurrentMap<Integer, Long>> offsetTable = wrapper.getOffsetTable();
+        if (offsetTable == null || offsetTable.isEmpty()) {
+            return;
+        }
+
+        for (String topicAtGroup : offsetTable.keySet()) {
+            if (topicAtGroup == null) {
+                continue;
+            }
+            int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
+            if (idx <= 0 || idx >= topicAtGroup.length() - 1) {
+                continue;
+            }
+            String group = topicAtGroup.substring(idx + 1);
+            if (!group.isEmpty()) {
+                groups.add(group);
+            }
+        }
+    }
+
+    /**
+     * Remove local consumer offsets whose topics have already been
+     * deleted on this broker. We use the current topicConfigTable as
+     * the source of truth:
+     * <ul>
+     *   <li>If a topic (or its parent topic for LMQ / lite topics) is
+     *   missing from {@code topicConfigTable}, we treat it as deleted
+     *   and remove all related offsets on slave.</li>
+     *   <li>If a topic still exists in {@code topicConfigTable} but
+     *   happens to have no new offset updates in this incremental
+     *   window, its offsets are kept.</li>
+     * </ul>
+     */
+    private void cleanupOrphanConsumerOffsets(ConsumerOffsetManager consumerOffsetManager,
+        ConcurrentMap<String, TopicConfig> topicConfigTable) {
+        if (consumerOffsetManager == null || topicConfigTable == null || topicConfigTable.isEmpty()) {
+            return;
+        }
+
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = consumerOffsetManager.getOffsetTable();
+        if (offsetTable == null || offsetTable.isEmpty()) {
+            return;
+        }
+
+        Iterator<Map.Entry<String, ConcurrentMap<Integer, Long>>> it = offsetTable.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, ConcurrentMap<Integer, Long>> entry = it.next();
+            String topicAtGroup = entry.getKey();
+            int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
+            if (idx <= 0) {
+                continue;
+            }
+
+            String topic = topicAtGroup.substring(0, idx);
+            String topicForMatch = topic;
+            // For lite topics backed by LMQ, we align with
+            // encodeByTopicAndSince and use parent topic when
+            // determining whether the topic still exists.
+            if (MixAll.isLmq(topic)) {
+                String parentTopic = LiteUtil.getParentTopic(topic);
+                if (parentTopic != null) {
+                    topicForMatch = parentTopic;
+                }
+            }
+
+            if (!topicConfigTable.containsKey(topicForMatch)) {
+                it.remove();
+                consumerOffsetManager.removeConsumerOffset(topicAtGroup);
+            }
+        }
+    }
+
     private void syncDelayOffset() {
         String masterAddrBak = this.masterAddr;
         if (masterAddrBak != null && !masterAddrBak.equals(brokerController.getBrokerAddr())) {
@@ -332,10 +438,23 @@ public class SlaveSynchronize {
                     Iterator<Map.Entry<String, SubscriptionGroupConfig>> iterator = curSubscriptionGroupTable.entrySet().iterator();
                     while (iterator.hasNext()) {
                         Map.Entry<String, SubscriptionGroupConfig> configEntry = iterator.next();
-                        if (!newSubscriptionGroupTable.containsKey(configEntry.getKey())) {
+                        String group = configEntry.getKey();
+                        if (!newSubscriptionGroupTable.containsKey(group)) {
                             iterator.remove();
+                            // Optionally clean local consumer offsets for
+                            // groups that have been deleted on master.
+                            // As a soft guardrail, if this group still
+                            // appeared in the most recent consumer
+                            // offset sync result from master, we skip
+                            // removing its offsets for now to avoid
+                            // losing offsets that are still present on
+                            // master.
+                            if (this.brokerController.getBrokerConfig().isCleanDeletedSubscriptionGroupOffsetInSlave()
+                                && !lastSyncedConsumerOffsetGroups.contains(group)) {
+                                this.brokerController.getConsumerOffsetManager().removeOffset(group);
+                            }
                         }
-                        subscriptionGroupManager.deleteSubscriptionGroupConfig(configEntry.getKey());
+                        subscriptionGroupManager.deleteSubscriptionGroupConfig(group);
                     }
                     // update
                     newSubscriptionGroupTable.values().forEach(subscriptionGroupManager::putSubscriptionGroupConfig);

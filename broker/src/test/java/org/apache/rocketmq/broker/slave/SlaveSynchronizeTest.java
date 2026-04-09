@@ -18,7 +18,9 @@ package org.apache.rocketmq.broker.slave;
 
 import java.io.UnsupportedEncodingException;
 import java.lang.reflect.Method;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import org.apache.rocketmq.broker.BrokerController;
@@ -349,6 +351,188 @@ public class SlaveSynchronizeTest {
         // For 5 topics and batch size 2, should be invoked 3 times
         org.mockito.Mockito.verify(brokerOuterAPI, org.mockito.Mockito.times(3))
             .getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong());
+    }
+
+    @Test
+    public void testSyncConsumerOffsetCleansOffsetsForDeletedTopicsOnly() throws Exception {
+        // topicConfigTable only contains existingTopic, deletedTopic has been removed on master
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put("existingTopic", new TopicConfig("existingTopic"));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        // Local offset table still keeps both existingTopic and deletedTopic offsets
+        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> localOffsetTable = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Integer, Long> existOffsets = new ConcurrentHashMap<>();
+        existOffsets.put(0, 100L);
+        localOffsetTable.put("existingTopic@G1", existOffsets);
+
+        ConcurrentHashMap<Integer, Long> deletedOffsets = new ConcurrentHashMap<>();
+        deletedOffsets.put(0, 200L);
+        localOffsetTable.put("deletedTopic@G1", deletedOffsets);
+
+        when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
+        when(consumerOffsetManager.getOffsetTable()).thenReturn(localOffsetTable);
+
+        // Master returns incremental offsets only for existingTopic
+        ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> remoteOffsets = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> remoteExistOffsets = new ConcurrentHashMap<>();
+        remoteExistOffsets.put(0, 150L);
+        remoteOffsets.put("existingTopic@G1", remoteExistOffsets);
+        wrapper.setOffsetTable(remoteOffsets);
+        wrapper.setDataVersion(new DataVersion());
+
+        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(wrapper);
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // Offsets for deletedTopic should be removed, existingTopic should be kept and updated
+        Assert.assertFalse(localOffsetTable.containsKey("deletedTopic@G1"));
+        Assert.assertTrue(localOffsetTable.containsKey("existingTopic@G1"));
+        Assert.assertEquals(150L, localOffsetTable.get("existingTopic@G1").get(0).longValue());
+        // Also verify removeConsumerOffset is invoked for deletedTopic
+        verify(consumerOffsetManager, times(1)).removeConsumerOffset("deletedTopic@G1");
+    }
+
+    @Test
+    public void testSyncConsumerOffsetKeepsOffsetsForExistingButNotUpdatedTopics() throws Exception {
+        // topicConfigTable contains topicA so it is treated as existing
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put("topicA", new TopicConfig("topicA"));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        // Local offset table has topicA offsets before sync
+        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> localOffsetTable = new ConcurrentHashMap<>();
+        ConcurrentHashMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
+        offsetsA.put(0, 100L);
+        localOffsetTable.put("topicA@G1", offsetsA);
+
+        when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
+        when(consumerOffsetManager.getOffsetTable()).thenReturn(localOffsetTable);
+
+        // Master has no new offsets for topicA in this incremental window
+        ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+        wrapper.setOffsetTable(new ConcurrentHashMap<>());
+        wrapper.setDataVersion(new DataVersion());
+        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(wrapper);
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // Offsets for topicA should still exist and keep original value
+        Assert.assertTrue(localOffsetTable.containsKey("topicA@G1"));
+        Assert.assertEquals(100L, localOffsetTable.get("topicA@G1").get(0).longValue());
+        // No removal should be triggered for topicA
+        verify(consumerOffsetManager, times(0)).removeConsumerOffset("topicA@G1");
+    }
+
+    @Test
+    public void testSyncSubscriptionGroupConfigCleansOffsetsWhenEnabled() throws Exception {
+        // Enable group-offset cleanup in slave
+        BrokerConfig brokerConfig = brokerController.getBrokerConfig();
+        brokerConfig.setCleanDeletedSubscriptionGroupOffsetInSlave(true);
+
+        // Current subscription groups on slave: G1, G2
+        ConcurrentHashMap<String, SubscriptionGroupConfig> curTable = new ConcurrentHashMap<>();
+        curTable.put("G1", new SubscriptionGroupConfig());
+        curTable.put("G2", new SubscriptionGroupConfig());
+
+        when(subscriptionGroupManager.getSubscriptionGroupTable()).thenReturn(curTable);
+
+        // Master only keeps G1 now
+        SubscriptionGroupWrapper wrapper = new SubscriptionGroupWrapper();
+        ConcurrentHashMap<String, SubscriptionGroupConfig> newTable = new ConcurrentHashMap<>();
+        newTable.put("G1", new SubscriptionGroupConfig());
+        wrapper.setSubscriptionGroupTable(newTable);
+        wrapper.setDataVersion(new DataVersion());
+
+        when(brokerOuterAPI.getAllSubscriptionGroupConfig(anyString())).thenReturn(wrapper);
+
+        // Invoke syncSubscriptionGroupConfig via reflection
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncSubscriptionGroupConfig");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // G2 should be removed from local table
+        Assert.assertFalse(curTable.containsKey("G2"));
+        // And removeOffset should be called for group G2
+        verify(consumerOffsetManager, times(1)).removeOffset("G2");
+    }
+
+    @Test
+    public void testSyncSubscriptionGroupConfigKeepsOffsetsWhenDisabled() throws Exception {
+        // Disable group-offset cleanup in slave (default false, set explicitly for clarity)
+        BrokerConfig brokerConfig = brokerController.getBrokerConfig();
+        brokerConfig.setCleanDeletedSubscriptionGroupOffsetInSlave(false);
+
+        // Current subscription groups on slave: G1, G2
+        ConcurrentHashMap<String, SubscriptionGroupConfig> curTable = new ConcurrentHashMap<>();
+        curTable.put("G1", new SubscriptionGroupConfig());
+        curTable.put("G2", new SubscriptionGroupConfig());
+
+        when(subscriptionGroupManager.getSubscriptionGroupTable()).thenReturn(curTable);
+
+        // Master only keeps G1 now
+        SubscriptionGroupWrapper wrapper = new SubscriptionGroupWrapper();
+        ConcurrentHashMap<String, SubscriptionGroupConfig> newTable = new ConcurrentHashMap<>();
+        newTable.put("G1", new SubscriptionGroupConfig());
+        wrapper.setSubscriptionGroupTable(newTable);
+        wrapper.setDataVersion(new DataVersion());
+
+        when(brokerOuterAPI.getAllSubscriptionGroupConfig(anyString())).thenReturn(wrapper);
+
+        // Invoke syncSubscriptionGroupConfig via reflection
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncSubscriptionGroupConfig");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // G2 should be removed from local subscriptionGroupTable (config), as before
+        Assert.assertFalse(curTable.containsKey("G2"));
+        // But removeOffset should NOT be called when the switch is disabled
+        verify(consumerOffsetManager, times(0)).removeOffset("G2");
+    }
+
+    @Test
+    public void testSyncSubscriptionGroupConfigSkipsOffsetCleanupWhenGroupHasRecentOffsets() throws Exception {
+        // Enable group-offset cleanup in slave
+        BrokerConfig brokerConfig = brokerController.getBrokerConfig();
+        brokerConfig.setCleanDeletedSubscriptionGroupOffsetInSlave(true);
+
+        // Current subscription groups on slave: G1, G2
+        ConcurrentHashMap<String, SubscriptionGroupConfig> curTable = new ConcurrentHashMap<>();
+        curTable.put("G1", new SubscriptionGroupConfig());
+        curTable.put("G2", new SubscriptionGroupConfig());
+
+        when(subscriptionGroupManager.getSubscriptionGroupTable()).thenReturn(curTable);
+
+        // Master only keeps G1 now
+        SubscriptionGroupWrapper wrapper = new SubscriptionGroupWrapper();
+        ConcurrentHashMap<String, SubscriptionGroupConfig> newTable = new ConcurrentHashMap<>();
+        newTable.put("G1", new SubscriptionGroupConfig());
+        wrapper.setSubscriptionGroupTable(newTable);
+        wrapper.setDataVersion(new DataVersion());
+
+        when(brokerOuterAPI.getAllSubscriptionGroupConfig(anyString())).thenReturn(wrapper);
+
+        // Simulate that G2 still had offsets in the latest consumer offset sync round
+        java.lang.reflect.Field field = SlaveSynchronize.class.getDeclaredField("lastSyncedConsumerOffsetGroups");
+        field.setAccessible(true);
+        Set<String> groups = new HashSet<>();
+        groups.add("G2");
+        field.set(slaveSynchronize, groups);
+
+        // Invoke syncSubscriptionGroupConfig via reflection
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncSubscriptionGroupConfig");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        // G2 should be removed from local subscriptionGroupTable (config), as before
+        Assert.assertFalse(curTable.containsKey("G2"));
+        // But removeOffset should NOT be called for G2 because it still appeared in last offset sync
+        verify(consumerOffsetManager, times(0)).removeOffset("G2");
     }
 
     @Test
