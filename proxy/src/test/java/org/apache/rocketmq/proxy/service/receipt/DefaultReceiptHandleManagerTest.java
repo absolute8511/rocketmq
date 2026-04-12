@@ -568,7 +568,7 @@ public class DefaultReceiptHandleManagerTest extends BaseServiceTest {
         // Handle must be removed from the manager so it is no longer tracked
         await().atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
             ReceiptHandleGroup receiptHandleGroup = receiptHandleManager.receiptHandleGroupMap.values().stream()
-                .findFirst().get();
+                .findFirst().orElseThrow(() -> new AssertionError("expected receipt handle group in map but it was absent"));
             assertTrue(receiptHandleGroup.isEmpty());
         });
     }
