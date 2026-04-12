@@ -151,7 +151,11 @@ public class DefaultReceiptHandleManager extends AbstractStartAndShutdown implem
     }
 
     protected boolean clientIsOffline(ReceiptHandleGroupKey groupKey) {
-        return this.consumerManager.findChannel(groupKey.getGroup(), groupKey.getChannel()) == null;
+        Channel channel = groupKey.getChannel();
+        if (!channel.isActive()) {
+            return true;
+        }
+        return this.consumerManager.findChannel(groupKey.getGroup(), channel) == null;
     }
 
     protected void scheduleRenewTask() {
@@ -223,6 +227,8 @@ public class DefaultReceiptHandleManager extends AbstractStartAndShutdown implem
                     }
                 });
             } else {
+                log.warn("handle has exceeded max renewMaxTimeMillis, stop renewing and nack it. renewMaxTimeMillis:{}, handle:{}",
+                    proxyConfig.getRenewMaxTimeMillis(), messageReceiptHandle);
                 SubscriptionGroupConfig subscriptionGroupConfig =
                     metadataService.getSubscriptionGroupConfig(context, messageReceiptHandle.getGroup());
                 if (subscriptionGroupConfig == null) {
