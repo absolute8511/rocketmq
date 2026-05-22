@@ -146,7 +146,7 @@ public class ConsumerOffsetManagerTest {
     }
 
     @Test
-    public void testEncodeByTopicAndSince_filtersWhenTimestampEqualsSince() {
+    public void testEncodeByTopicAndSince_keepsWhenTimestampEqualsSince() {
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
         ConcurrentMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
         offsetsA.put(0, 10L);
@@ -164,8 +164,8 @@ public class ConsumerOffsetManagerTest {
         ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeByTopicAndSince(topics, base);
         Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
 
-        // lastUpdate == sinceTimestamp should also be filtered out
-        assertThat(result).doesNotContainKey("topicA" + TOPIC_GROUP_SEPARATOR + "G1");
+        // sinceTimestamp is an inclusive lower bound, so lastUpdate == sinceTimestamp should be kept
+        assertThat(result).containsKey("topicA" + TOPIC_GROUP_SEPARATOR + "G1");
     }
 
     @Test
@@ -215,10 +215,38 @@ public class ConsumerOffsetManagerTest {
         Map<String, ConcurrentMap<Integer, Long>> result1 = wrapper1.getOffsetTable();
         assertThat(result1).containsKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
 
-        // 2) since >= parent last update timestamp, lite topic should be filtered out
+        // 2) since == parent last update timestamp, lite topic should still be kept because since is inclusive
         ConsumerOffsetSerializeWrapper wrapper2 = consumerOffsetManager.encodeByTopicAndSince(
             new HashSet<String>() {{ add(parentTopic); }}, base);
         Map<String, ConcurrentMap<Integer, Long>> result2 = wrapper2.getOffsetTable();
-        assertThat(result2).doesNotContainKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
+        assertThat(result2).containsKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
+
+        // 3) since > parent last update timestamp, lite topic should be filtered out
+        ConsumerOffsetSerializeWrapper wrapper3 = consumerOffsetManager.encodeByTopicAndSince(
+            new HashSet<String>() {{ add(parentTopic); }}, base + 1_000);
+        Map<String, ConcurrentMap<Integer, Long>> result3 = wrapper3.getOffsetTable();
+        assertThat(result3).doesNotContainKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
+    }
+
+    @Test
+    public void testCleanOffsetByTopic_cleansAllOffsetTablesAndTimestamp() {
+        String topic = "TopicName";
+        String group = "GroupName";
+        Mockito.when(brokerController.getBrokerConfig()).thenReturn(new BrokerConfig());
+        consumerOffsetManager.commitOffset("Commit", group, topic, 0, 100);
+        consumerOffsetManager.assignResetOffset(topic, group, 1, 200);
+        consumerOffsetManager.commitPullOffset("Pull", group, topic, 2, 300);
+
+        Assert.assertEquals(100L, consumerOffsetManager.queryOffset(group, topic, 0));
+        Assert.assertTrue(consumerOffsetManager.hasOffsetReset(topic, group, 1));
+        Assert.assertEquals(300L, consumerOffsetManager.queryPullOffset(group, topic, 2));
+        Assert.assertTrue(consumerOffsetManager.getTopicOffsetUpdateTimestampTable().containsKey(topic));
+
+        consumerOffsetManager.cleanOffsetByTopic(topic);
+
+        Assert.assertEquals(-1L, consumerOffsetManager.queryOffset(group, topic, 0));
+        Assert.assertFalse(consumerOffsetManager.hasOffsetReset(topic, group, 1));
+        Assert.assertEquals(-1L, consumerOffsetManager.queryPullOffset(group, topic, 2));
+        Assert.assertFalse(consumerOffsetManager.getTopicOffsetUpdateTimestampTable().containsKey(topic));
     }
 }

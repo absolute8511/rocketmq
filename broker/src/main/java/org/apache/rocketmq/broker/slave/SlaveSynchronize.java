@@ -166,7 +166,7 @@ public class SlaveSynchronize {
 
             // Collect all topics known on this broker (after topic config sync).
             ConcurrentMap<String, TopicConfig> topicConfigTable = this.brokerController.getTopicConfigManager().getTopicConfigTable();
-            if (topicConfigTable == null || topicConfigTable.isEmpty()) {
+            if (topicConfigTable == null) {
                 return;
             }
 
@@ -280,7 +280,7 @@ public class SlaveSynchronize {
         }
 
         // Build topic whitelist for this batch.
-        List<String> requestedTopics = new ArrayList<>(batchTopics);
+        Set<String> requestedTopics = new HashSet<>(batchTopics);
 
         for (String topicAtGroup : wrapper.getOffsetTable().keySet()) {
             int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
@@ -355,7 +355,7 @@ public class SlaveSynchronize {
      */
     private void cleanupOrphanConsumerOffsets(ConsumerOffsetManager consumerOffsetManager,
         ConcurrentMap<String, TopicConfig> topicConfigTable) {
-        if (consumerOffsetManager == null || topicConfigTable == null || topicConfigTable.isEmpty()) {
+        if (consumerOffsetManager == null || topicConfigTable == null) {
             return;
         }
 
@@ -364,10 +364,8 @@ public class SlaveSynchronize {
             return;
         }
 
-        Iterator<Map.Entry<String, ConcurrentMap<Integer, Long>>> it = offsetTable.entrySet().iterator();
-        while (it.hasNext()) {
-            Map.Entry<String, ConcurrentMap<Integer, Long>> entry = it.next();
-            String topicAtGroup = entry.getKey();
+        Set<String> orphanTopics = new HashSet<>();
+        for (String topicAtGroup : offsetTable.keySet()) {
             int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
             if (idx <= 0) {
                 continue;
@@ -386,9 +384,12 @@ public class SlaveSynchronize {
             }
 
             if (!topicConfigTable.containsKey(topicForMatch)) {
-                it.remove();
-                consumerOffsetManager.removeConsumerOffset(topicAtGroup);
+                orphanTopics.add(topic);
             }
+        }
+
+        for (String topic : orphanTopics) {
+            consumerOffsetManager.cleanOffsetByTopic(topic);
         }
     }
 

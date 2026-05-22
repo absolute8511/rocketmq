@@ -19,10 +19,16 @@ package org.apache.rocketmq.broker.config.v2;
 
 import java.io.File;
 import java.io.IOException;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.concurrent.ConcurrentMap;
 import org.apache.rocketmq.broker.BrokerController;
 import org.apache.rocketmq.broker.offset.ConsumerOffsetManager;
 import org.apache.rocketmq.common.BrokerConfig;
 import org.apache.rocketmq.common.MixAll;
+import org.apache.rocketmq.common.lite.LiteUtil;
+import org.apache.rocketmq.remoting.protocol.body.ConsumerOffsetSerializeWrapper;
 import org.apache.rocketmq.store.config.MessageStoreConfig;
 import org.junit.After;
 import org.junit.Assert;
@@ -205,6 +211,63 @@ public class ConsumerOffsetManagerV2Test {
         consumerOffsetManagerV2.load();
         Assert.assertEquals(-1L, consumerOffsetManagerV2.queryOffset(group, topic, queueId));
         Assert.assertEquals(-1L, consumerOffsetManagerV2.queryOffset(group, topic2, queueId));
+    }
+
+    @Test
+    public void testCommitOffset_RecordsTimestampForIncrementalSync() {
+        Assert.assertTrue(consumerOffsetManagerV2.load());
+
+        String clientHost = "localhost";
+        String topic = "T1";
+        String group = "G0";
+        int queueId = 1;
+        long queueOffset = 100;
+        consumerOffsetManagerV2.commitOffset(clientHost, group, topic, queueId, queueOffset);
+
+        Assert.assertTrue(consumerOffsetManagerV2.getTopicOffsetUpdateTimestampTable().containsKey(topic));
+    }
+
+    @Test
+    public void testEncodeByTopicAndSince_IncludesLmqOffsetsFromRocksDB() {
+        Assert.assertTrue(consumerOffsetManagerV2.load());
+
+        String clientHost = "localhost";
+        String topic = MixAll.LMQ_PREFIX + "T1";
+        String group = "G0";
+        int queueId = 1;
+        long queueOffset = 100;
+        consumerOffsetManagerV2.commitOffset(clientHost, group, topic, queueId, queueOffset);
+
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManagerV2.encodeByTopicAndSince(
+            Collections.singleton(topic), 0);
+        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
+
+        Assert.assertEquals(queueOffset,
+            result.get(topic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + group).get(queueId).longValue());
+    }
+
+    @Test
+    public void testEncodeByTopicAndSince_FiltersLiteTopicByParentAndInclusiveTimestamp() {
+        Assert.assertTrue(consumerOffsetManagerV2.load());
+
+        String clientHost = "localhost";
+        String parentTopic = "ParentTopic";
+        String liteTopic = LiteUtil.toLmqName(parentTopic, "ChildTopic");
+        String group = "G0";
+        int queueId = 1;
+        long queueOffset = 100;
+        consumerOffsetManagerV2.commitOffset(clientHost, group, liteTopic, queueId, queueOffset);
+
+        Long lastUpdate = consumerOffsetManagerV2.getTopicOffsetUpdateTimestampTable().get(parentTopic);
+        Assert.assertNotNull(lastUpdate);
+
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManagerV2.encodeByTopicAndSince(
+            new HashSet<String>() {{ add(parentTopic); }}, lastUpdate);
+        Assert.assertTrue(wrapper.getOffsetTable().containsKey(liteTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + group));
+
+        ConsumerOffsetSerializeWrapper filteredWrapper = consumerOffsetManagerV2.encodeByTopicAndSince(
+            new HashSet<String>() {{ add(parentTopic); }}, lastUpdate + 1);
+        Assert.assertFalse(filteredWrapper.getOffsetTable().containsKey(liteTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + group));
     }
 
 }

@@ -97,7 +97,15 @@ public class ConsumerOffsetManager extends ConfigManager {
     }
 
     public void cleanOffsetByTopic(String topic) {
-        Iterator<Entry<String, ConcurrentMap<Integer, Long>>> it = this.offsetTable.entrySet().iterator();
+        cleanOffsetTableByTopic(this.offsetTable, topic, true);
+        cleanOffsetTableByTopic(this.pullOffsetTable, topic, false);
+        cleanOffsetTableByTopic(this.resetOffsetTable, topic, false);
+        this.topicOffsetUpdateTimestampTable.remove(getTopicForTimestamp(topic));
+    }
+
+    private void cleanOffsetTableByTopic(ConcurrentMap<String, ConcurrentMap<Integer, Long>> table, String topic,
+        boolean removeFromStore) {
+        Iterator<Entry<String, ConcurrentMap<Integer, Long>>> it = table.entrySet().iterator();
         while (it.hasNext()) {
             Entry<String, ConcurrentMap<Integer, Long>> next = it.next();
             String topicAtGroup = next.getKey();
@@ -105,9 +113,9 @@ public class ConsumerOffsetManager extends ConfigManager {
                 String[] arrays = topicAtGroup.split(TOPIC_GROUP_SEPARATOR);
                 if (arrays.length == 2 && topic.equals(arrays[0])) {
                     it.remove();
-                    removeConsumerOffset(topicAtGroup);
-                    pullOffsetTable.remove(topicAtGroup);
-                    resetOffsetTable.remove(topicAtGroup);
+                    if (removeFromStore) {
+                        removeConsumerOffset(topicAtGroup);
+                    }
                     LOG.warn("Clean topic's offset, {}, {}", topicAtGroup, next.getValue());
                 }
             }
@@ -225,11 +233,19 @@ public class ConsumerOffsetManager extends ConfigManager {
                 LOG.warn("[NOTIFYME]update consumer offset less than store. clientHost={}, key={}, queueId={}, requestOffset={}, storeOffset={}", clientHost, key, queueId, offset, storeOffset);
             }
         }
-        // record last update time for incremental sync in topic level
-        long now = System.currentTimeMillis();
         int idx = key.indexOf(TOPIC_GROUP_SEPARATOR);
         String topic = idx > 0 ? key.substring(0, idx) : key;
+        recordTopicOffsetUpdateTimestamp(topic);
+        if (versionChangeCounter.incrementAndGet() % brokerController.getBrokerConfig().getConsumerOffsetUpdateVersionStep() == 0) {
+            updateDataVersion();
+        }
+    }
 
+    protected void recordTopicOffsetUpdateTimestamp(String topic) {
+        this.topicOffsetUpdateTimestampTable.put(getTopicForTimestamp(topic), System.currentTimeMillis());
+    }
+
+    protected String getTopicForTimestamp(String topic) {
         // For lite topics (backed by LMQ), use the parent topic as
         // the granularity for last-update timestamp:
         // - Normal topics: record timestamp by topic name directly.
@@ -243,11 +259,7 @@ public class ConsumerOffsetManager extends ConfigManager {
                 topicForTimestamp = parentTopic;
             }
         }
-
-        this.topicOffsetUpdateTimestampTable.put(topicForTimestamp, now);
-        if (versionChangeCounter.incrementAndGet() % brokerController.getBrokerConfig().getConsumerOffsetUpdateVersionStep() == 0) {
-            updateDataVersion();
-        }
+        return topicForTimestamp;
     }
 
     public void commitPullOffset(final String clientHost, final String group, final String topic, final int queueId,
@@ -362,59 +374,8 @@ public class ConsumerOffsetManager extends ConfigManager {
             }
             String topic = arrays[0];
 
-            // Topic filter rules:
-            // 1. When topics is null or empty: do not filter; include
-            //    all topics (including LMQ / lite topics).
-            // 2. For normal topics: topic itself must be in the
-            //    whitelist.
-            // 3. For LMQ / lite topics: use parent topic to decide
-            //    whether to include; only offsets whose parent topic
-            //    appears in the whitelist will be encoded.
-            if (topics != null && !topics.isEmpty()) {
-                boolean match = false;
-                if (!MixAll.isLmq(topic)) {
-                    // Normal topic: match by topic name directly
-                    match = topics.contains(topic);
-                } else {
-                    // LMQ / lite topic: use parent topic as matching granularity
-                    if (topics.contains(topic)) {
-                        // Compatibility: whitelist already contains this LMQ name
-                        match = true;
-                    } else {
-                        for (String parentTopic : topics) {
-                            if (LiteUtil.belongsTo(topic, parentTopic)) {
-                                match = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (!match) {
-                    continue;
-                }
-            }
-
-            // Time filtering: keep consistent with how timestamps are recorded in commitOffset
-            // - Normal topic: filter by topic itself
-            // - LMQ / lite topic: filter by parent topic
-            if (sinceTimestamp > 0) {
-                String topicForTimestamp = topic;
-                if (MixAll.isLmq(topic)) {
-                    String parentTopic = LiteUtil.getParentTopic(topic);
-                    if (parentTopic != null) {
-                        topicForTimestamp = parentTopic;
-                    }
-                }
-
-                Long lastUpdate = this.topicOffsetUpdateTimestampTable.get(topicForTimestamp);
-                // If we have a recorded timestamp that is not newer than sinceTimestamp,
-                // we can safely skip all offsets under this topic. For topics without
-                // a recorded timestamp (for example, old data reloaded after restart),
-                // keep them to avoid missing any updates.
-                if (lastUpdate != null && lastUpdate <= sinceTimestamp) {
-                    continue;
-                }
+            if (!shouldEncodeOffset(topic, topics, sinceTimestamp)) {
+                continue;
             }
 
             result.put(topicAtGroup, new ConcurrentHashMap<>(entry.getValue()));
@@ -423,6 +384,57 @@ public class ConsumerOffsetManager extends ConfigManager {
         wrapper.setOffsetTable(result);
         wrapper.setDataVersion(this.dataVersion);
         return wrapper;
+    }
+
+    protected boolean shouldEncodeOffset(String topic, Set<String> topics, long sinceTimestamp) {
+        // Topic filter rules:
+        // 1. When topics is null or empty: do not filter; include
+        //    all topics (including LMQ / lite topics).
+        // 2. For normal topics: topic itself must be in the
+        //    whitelist.
+        // 3. For LMQ / lite topics: use parent topic to decide
+        //    whether to include; only offsets whose parent topic
+        //    appears in the whitelist will be encoded.
+        if (topics != null && !topics.isEmpty()) {
+            boolean match = false;
+            if (!MixAll.isLmq(topic)) {
+                // Normal topic: match by topic name directly
+                match = topics.contains(topic);
+            } else {
+                // LMQ / lite topic: use parent topic as matching granularity
+                if (topics.contains(topic)) {
+                    // Compatibility: whitelist already contains this LMQ name
+                    match = true;
+                } else {
+                    for (String parentTopic : topics) {
+                        if (LiteUtil.belongsTo(topic, parentTopic)) {
+                            match = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (!match) {
+                return false;
+            }
+        }
+
+        // Time filtering: keep consistent with how timestamps are recorded in commitOffset
+        // - Normal topic: filter by topic itself
+        // - LMQ / lite topic: filter by parent topic
+        if (sinceTimestamp > 0) {
+            Long lastUpdate = this.topicOffsetUpdateTimestampTable.get(getTopicForTimestamp(topic));
+            // If we have a recorded timestamp that is older than sinceTimestamp,
+            // we can safely skip all offsets under this topic. For topics without
+            // a recorded timestamp (for example, old data reloaded after restart),
+            // keep them to avoid missing any updates. Equality is kept because
+            // sinceTimestamp is defined as an inclusive lower bound.
+            if (lastUpdate != null && lastUpdate < sinceTimestamp) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public ConcurrentMap<String, ConcurrentMap<Integer, Long>> getOffsetTable() {
