@@ -204,7 +204,7 @@ public class SlaveSynchronize {
                 this.brokerController.getBrokerOuterAPI().getNormalConsumerOffset(masterAddrBak);
             if (normalOffsetWrapper != null && normalOffsetWrapper.getOffsetTable() != null) {
                 cleanupStaleNormalOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable());
-                mergeNormalOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable());
+                mergeOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable(), false);
                 collectOffsetGroupsFromWrapper(normalOffsetWrapper, syncedGroupsThisRound);
                 if (normalOffsetWrapper.getDataVersion() != null) {
                     consumerOffsetManager.getDataVersion().assignNewOne(normalOffsetWrapper.getDataVersion());
@@ -225,7 +225,7 @@ public class SlaveSynchronize {
                 }
 
                 collectOffsetGroupsFromWrapper(lmqOffsetWrapper, syncedGroupsThisRound);
-                mergeOffsetWrapper(consumerOffsetManager, lmqOffsetWrapper);
+                mergeOffsets(consumerOffsetManager, lmqOffsetWrapper.getOffsetTable(), true);
                 if (lmqOffsetWrapper.getDataVersion() != null) {
                     consumerOffsetManager.getDataVersion().assignNewOne(lmqOffsetWrapper.getDataVersion());
                 }
@@ -249,14 +249,14 @@ public class SlaveSynchronize {
         }
     }
 
-    private void mergeNormalOffsets(ConsumerOffsetManager consumerOffsetManager,
-        ConcurrentMap<String, ConcurrentMap<Integer, Long>> normalOffsetTable) {
-        if (consumerOffsetManager == null || normalOffsetTable == null) {
+    private void mergeOffsets(ConsumerOffsetManager consumerOffsetManager,
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable, boolean lmqOffset) {
+        if (consumerOffsetManager == null || offsetTable == null) {
             return;
         }
-        for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : normalOffsetTable.entrySet()) {
+        for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : offsetTable.entrySet()) {
             TopicGroup topicGroup = parseTopicGroup(entry.getKey());
-            if (topicGroup == null || MixAll.isLmq(topicGroup.topic) || entry.getValue() == null) {
+            if (topicGroup == null || MixAll.isLmq(topicGroup.topic) != lmqOffset || entry.getValue() == null) {
                 continue;
             }
             for (Map.Entry<Integer, Long> offsetEntry : entry.getValue().entrySet()) {
@@ -335,21 +335,6 @@ public class SlaveSynchronize {
             String group = topicAtGroup.substring(idx + 1);
             if (!group.isEmpty()) {
                 groups.add(group);
-            }
-        }
-    }
-
-    private void mergeOffsetWrapper(ConsumerOffsetManager consumerOffsetManager, ConsumerOffsetSerializeWrapper wrapper) {
-        if (consumerOffsetManager == null || wrapper == null || wrapper.getOffsetTable() == null) {
-            return;
-        }
-        for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : wrapper.getOffsetTable().entrySet()) {
-            TopicGroup topicGroup = parseTopicGroup(entry.getKey());
-            if (topicGroup == null || !MixAll.isLmq(topicGroup.topic) || entry.getValue() == null) {
-                continue;
-            }
-            for (Map.Entry<Integer, Long> offsetEntry : entry.getValue().entrySet()) {
-                consumerOffsetManager.commitOffset(null, topicGroup.group, topicGroup.topic, offsetEntry.getKey(), offsetEntry.getValue());
             }
         }
     }
