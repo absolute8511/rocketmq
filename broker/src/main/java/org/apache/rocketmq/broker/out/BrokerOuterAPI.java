@@ -889,18 +889,7 @@ public class BrokerOuterAPI {
     public ConsumerOffsetSerializeWrapper getAllConsumerOffset(
         final String addr) throws InterruptedException, RemotingTimeoutException,
         RemotingSendRequestException, RemotingConnectException, MQBrokerException {
-        RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ALL_CONSUMER_OFFSET, null);
-        RemotingCommand response = this.remotingClient.invokeSync(addr, request, 3000);
-        assert response != null;
-        switch (response.getCode()) {
-            case ResponseCode.SUCCESS: {
-                return ConsumerOffsetSerializeWrapper.decode(response.getBody(), ConsumerOffsetSerializeWrapper.class);
-            }
-            default:
-                break;
-        }
-
-        throw new MQBrokerException(response.getCode(), response.getRemark(), addr);
+        return getConsumerOffset(addr, null);
     }
 
     public ConsumerOffsetSerializeWrapper getNormalConsumerOffset(
@@ -910,18 +899,7 @@ public class BrokerOuterAPI {
         GetAllConsumerOffsetRequestHeader requestHeader = new GetAllConsumerOffsetRequestHeader();
         requestHeader.setOffsetType("NORMAL");
 
-        RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ALL_CONSUMER_OFFSET, requestHeader);
-        RemotingCommand response = this.remotingClient.invokeSync(addr, request, 3000);
-        assert response != null;
-        switch (response.getCode()) {
-            case ResponseCode.SUCCESS: {
-                return ConsumerOffsetSerializeWrapper.decode(response.getBody(), ConsumerOffsetSerializeWrapper.class);
-            }
-            default:
-                break;
-        }
-
-        throw new MQBrokerException(response.getCode(), response.getRemark(), addr);
+        return getConsumerOffset(addr, requestHeader);
     }
 
     public ConsumerOffsetSerializeWrapper getLmqConsumerOffsetByGroupBatch(
@@ -937,6 +915,12 @@ public class BrokerOuterAPI {
             requestHeader.setSinceTimestamp(sinceTimestamp);
         }
 
+        return getConsumerOffset(addr, requestHeader);
+    }
+
+    private ConsumerOffsetSerializeWrapper getConsumerOffset(
+        final String addr, final GetAllConsumerOffsetRequestHeader requestHeader) throws InterruptedException,
+        RemotingTimeoutException, RemotingSendRequestException, RemotingConnectException, MQBrokerException {
         RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ALL_CONSUMER_OFFSET, requestHeader);
         RemotingCommand response = this.remotingClient.invokeSync(addr, request, 3000);
         assert response != null;

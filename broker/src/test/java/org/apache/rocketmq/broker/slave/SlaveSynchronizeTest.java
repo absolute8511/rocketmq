@@ -331,7 +331,7 @@ public class SlaveSynchronizeTest {
 
         // Set batch size = 2
         BrokerConfig brokerConfig = brokerController.getBrokerConfig();
-        brokerConfig.setSyncConsumerOffsetBatchTopicNum(2);
+        brokerConfig.setSyncConsumerOffsetBatchNum(2);
 
         when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
         when(consumerOffsetManager.getOffsetTable()).thenReturn(new ConcurrentHashMap<>());
@@ -461,6 +461,7 @@ public class SlaveSynchronizeTest {
     public void testSyncConsumerOffsetReplacesNormalOffsetsAndPreservesLocalLmqOffsets() throws Exception {
         String lmqParentTopic = "lmqParentTopic";
         String lmqTopic = LiteUtil.toLmqName(lmqParentTopic, "LiteTopic");
+        String staleRemoteLmqTopic = LiteUtil.toLmqName(lmqParentTopic, "StaleRemoteLiteTopic");
         ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
         topicTable.put("remoteNormalTopic", new TopicConfig("remoteNormalTopic"));
         topicTable.put("staleNormalTopic", new TopicConfig("staleNormalTopic"));
@@ -481,6 +482,7 @@ public class SlaveSynchronizeTest {
         ConsumerOffsetSerializeWrapper normalWrapper = new ConsumerOffsetSerializeWrapper();
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> remoteNormalOffsets = new ConcurrentHashMap<>();
         remoteNormalOffsets.put("remoteNormalTopic@G1", offsetMap(0, 100L));
+        remoteNormalOffsets.put(staleRemoteLmqTopic + "@G1", offsetMap(0, 200L));
         normalWrapper.setOffsetTable(remoteNormalOffsets);
         normalWrapper.setDataVersion(new DataVersion());
         when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(normalWrapper);
@@ -492,6 +494,7 @@ public class SlaveSynchronizeTest {
         Assert.assertFalse(localOffsetTable.containsKey("staleNormalTopic@G1"));
         Assert.assertEquals(100L, localOffsetTable.get("remoteNormalTopic@G1").get(0).longValue());
         Assert.assertEquals(20L, localOffsetTable.get(lmqTopic + "@G1").get(0).longValue());
+        Assert.assertFalse(localOffsetTable.containsKey(staleRemoteLmqTopic + "@G1"));
     }
 
     @Test

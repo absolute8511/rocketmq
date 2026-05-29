@@ -352,12 +352,12 @@ public class BrokerConfig extends BrokerIdentity {
     private long delayOffsetUpdateVersionStep = 200;
 
     /**
-     * Max topic count in a single consumer offset sync batch between
+     * Max group count in a single consumer offset sync batch between
      * slave and master. This is mainly used to avoid a single
      * GET_ALL_CONSUMER_OFFSET response becoming too large when there
-     * are a lot of topics.
+     * are a lot of groups.
      */
-    private int syncConsumerOffsetBatchTopicNum = 100;
+    private int syncConsumerOffsetBatchNum = 100;
 
     /**
      * Safety time gap (in milliseconds) applied when issuing
@@ -1623,12 +1623,12 @@ public class BrokerConfig extends BrokerIdentity {
         this.consumerOffsetUpdateVersionStep = consumerOffsetUpdateVersionStep;
     }
 
-    public int getSyncConsumerOffsetBatchTopicNum() {
-        return syncConsumerOffsetBatchTopicNum;
+    public int getSyncConsumerOffsetBatchNum() {
+        return syncConsumerOffsetBatchNum;
     }
 
-    public void setSyncConsumerOffsetBatchTopicNum(int syncConsumerOffsetBatchTopicNum) {
-        this.syncConsumerOffsetBatchTopicNum = syncConsumerOffsetBatchTopicNum;
+    public void setSyncConsumerOffsetBatchNum(int syncConsumerOffsetBatchNum) {
+        this.syncConsumerOffsetBatchNum = syncConsumerOffsetBatchNum;
     }
 
     public long getSyncConsumerOffsetSafeGapMillis() {

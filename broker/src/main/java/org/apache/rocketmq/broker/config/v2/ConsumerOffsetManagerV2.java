@@ -28,6 +28,7 @@ import org.apache.rocketmq.broker.BrokerController;
 import org.apache.rocketmq.broker.offset.ConsumerOffsetManager;
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.config.AbstractRocksDBStorage;
+import org.apache.rocketmq.remoting.protocol.RemotingSerializable;
 import org.apache.rocketmq.remoting.protocol.body.ConsumerOffsetSerializeWrapper;
 import org.apache.rocketmq.store.MessageStore;
 import org.rocksdb.RocksDBException;
@@ -313,6 +314,16 @@ public class ConsumerOffsetManagerV2 extends ConsumerOffsetManager {
         keyBuf.writeBytes(groupBytes);
         keyBuf.writeByte(AbstractRocksDBStorage.CTRL_2);
         return keyBuf;
+    }
+
+    @Override
+    public String encode(final boolean prettyFormat) {
+        ConsumerOffsetSerializeWrapper wrapper = encodeNormalOffset();
+        ConsumerOffsetSerializeWrapper lmqWrapper = encodeLmqByGroupAndSince(null, 0L);
+        if (lmqWrapper != null && lmqWrapper.getOffsetTable() != null) {
+            wrapper.getOffsetTable().putAll(lmqWrapper.getOffsetTable());
+        }
+        return RemotingSerializable.toJson(wrapper, prettyFormat);
     }
 
     @Override

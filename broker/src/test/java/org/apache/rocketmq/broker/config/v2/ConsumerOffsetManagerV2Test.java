@@ -27,6 +27,7 @@ import org.apache.rocketmq.broker.offset.ConsumerOffsetManager;
 import org.apache.rocketmq.common.BrokerConfig;
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.lite.LiteUtil;
+import org.apache.rocketmq.remoting.protocol.RemotingSerializable;
 import org.apache.rocketmq.remoting.protocol.body.ConsumerOffsetSerializeWrapper;
 import org.apache.rocketmq.store.config.MessageStoreConfig;
 import org.junit.After;
@@ -310,6 +311,28 @@ public class ConsumerOffsetManagerV2Test {
         Assert.assertTrue(result.containsKey(lmqTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G1"));
         Assert.assertTrue(result.containsKey(lmqTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G2"));
         Assert.assertFalse(result.containsKey(normalTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G1"));
+    }
+
+    @Test
+    public void testEncode_FullSnapshotIncludesNormalAndLmqOffsetsForOldSlave() {
+        Assert.assertTrue(consumerOffsetManagerV2.load());
+
+        String clientHost = "localhost";
+        String normalTopic = "T1";
+        String lmqTopic = MixAll.LMQ_PREFIX + "T1";
+        String group = "G0";
+        int queueId = 1;
+        consumerOffsetManagerV2.commitOffset(clientHost, group, normalTopic, queueId, 100L);
+        consumerOffsetManagerV2.commitOffset(clientHost, group, lmqTopic, queueId, 200L);
+
+        ConsumerOffsetSerializeWrapper wrapper = RemotingSerializable.fromJson(
+            consumerOffsetManagerV2.encode(), ConsumerOffsetSerializeWrapper.class);
+        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
+
+        Assert.assertEquals(100L,
+            result.get(normalTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + group).get(queueId).longValue());
+        Assert.assertEquals(200L,
+            result.get(lmqTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + group).get(queueId).longValue());
     }
 
 }

@@ -169,7 +169,7 @@ public class SlaveSynchronize {
                 return;
             }
 
-            int batchSize = this.brokerController.getBrokerConfig().getSyncConsumerOffsetBatchTopicNum();
+            int batchSize = this.brokerController.getBrokerConfig().getSyncConsumerOffsetBatchNum();
             if (batchSize <= 0) {
                 batchSize = 100;
             }
@@ -252,7 +252,23 @@ public class SlaveSynchronize {
 
     private void replaceNormalOffsets(ConsumerOffsetManager consumerOffsetManager,
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> normalOffsetTable) {
-        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> newOffsetTable = new ConcurrentHashMap<>(normalOffsetTable);
+        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> newOffsetTable = new ConcurrentHashMap<>();
+        if (normalOffsetTable != null) {
+            for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : normalOffsetTable.entrySet()) {
+                String topicAtGroup = entry.getKey();
+                if (topicAtGroup == null) {
+                    continue;
+                }
+                int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
+                if (idx <= 0) {
+                    continue;
+                }
+                String topic = topicAtGroup.substring(0, idx);
+                if (!MixAll.isLmq(topic)) {
+                    newOffsetTable.put(topicAtGroup, entry.getValue());
+                }
+            }
+        }
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> currentOffsetTable = consumerOffsetManager.getOffsetTable();
         if (currentOffsetTable != null) {
             for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : currentOffsetTable.entrySet()) {
@@ -311,6 +327,9 @@ public class SlaveSynchronize {
                 continue;
             }
             String topic = topicAtGroup.substring(0, idx);
+            if (!MixAll.isLmq(topic)) {
+                continue;
+            }
             String group = topicAtGroup.substring(idx + 1);
             for (Map.Entry<Integer, Long> offsetEntry : entry.getValue().entrySet()) {
                 consumerOffsetManager.commitOffset(null, group, topic, offsetEntry.getKey(), offsetEntry.getValue());
