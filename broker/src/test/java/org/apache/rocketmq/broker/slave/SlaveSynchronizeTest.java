@@ -559,6 +559,49 @@ public class SlaveSynchronizeTest {
     }
 
     @Test
+    public void testSyncConsumerOffsetDoesNotCleanMissingLmqOffsetsInIncrementalResult() throws Exception {
+        String parentTopic = "parentTopic";
+        String lmqTopic = LiteUtil.toLmqName(parentTopic, "childTopic");
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put(parentTopic, new TopicConfig(parentTopic));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        ConcurrentHashMap<String, SubscriptionGroupConfig> subscriptionGroups = new ConcurrentHashMap<>();
+        subscriptionGroups.put("G1", new SubscriptionGroupConfig());
+        when(subscriptionGroupManager.getSubscriptionGroupTable()).thenReturn(subscriptionGroups);
+
+        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> localOffsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> localQueues = new ConcurrentHashMap<>();
+        localQueues.put(0, 100L);
+        localQueues.put(1, 200L);
+        localOffsetTable.put(lmqTopic + "@G1", localQueues);
+        when(consumerOffsetManager.getOffsetTable()).thenReturn(localOffsetTable);
+        stubCommitOffset(localOffsetTable);
+
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(new ConsumerOffsetSerializeWrapper());
+
+        ConsumerOffsetSerializeWrapper lmqWrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> lmqOffsets = new ConcurrentHashMap<>();
+        lmqOffsets.put(lmqTopic + "@G1", offsetMap(0, 150L));
+        lmqWrapper.setOffsetTable(lmqOffsets);
+        lmqWrapper.setDataVersion(new DataVersion());
+        when(brokerOuterAPI.getLmqConsumerOffsetByGroupBatch(anyString(), any(List.class), anyLong()))
+            .thenReturn(lmqWrapper);
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        Assert.assertTrue(localOffsetTable.containsKey(lmqTopic + "@G1"));
+        Assert.assertEquals(2, localOffsetTable.get(lmqTopic + "@G1").size());
+        Assert.assertEquals(150L, localOffsetTable.get(lmqTopic + "@G1").get(0).longValue());
+        Assert.assertEquals(200L, localOffsetTable.get(lmqTopic + "@G1").get(1).longValue());
+        verify(consumerOffsetManager, times(1)).commitOffset(null, "G1", lmqTopic, 0, 150L);
+        verify(consumerOffsetManager, times(0)).removeConsumerOffset(lmqTopic + "@G1");
+        verify(consumerOffsetManager, times(0)).removeOffset("G1");
+    }
+
+    @Test
     public void testSyncConsumerOffsetCleansLmqOffsetsByParentTopicExistence() throws Exception {
         String parentTopic = "parentTopic";
         String existingLmqTopic = LiteUtil.toLmqName(parentTopic, "childTopic");
