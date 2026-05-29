@@ -1992,20 +1992,21 @@ public class AdminBrokerProcessor implements NettyRequestProcessor {
         }
 
         String content;
-        if (requestHeader != null && (StringUtils.isNotBlank(requestHeader.getTopicList())
-            || requestHeader.getSinceTimestamp() != null && requestHeader.getSinceTimestamp() > 0)) {
-            Set<String> topics = null;
-            if (StringUtils.isNotBlank(requestHeader.getTopicList())) {
-                String[] topicArray = requestHeader.getTopicList().split(",");
-                topics = new HashSet<>(topicArray.length);
-                for (String t : topicArray) {
-                    if (StringUtils.isNotBlank(t)) {
-                        topics.add(t.trim());
+        if (requestHeader != null && "NORMAL".equalsIgnoreCase(requestHeader.getOffsetType())) {
+            content = RemotingSerializable.toJson(this.brokerController.getConsumerOffsetManager().encodeNormalOffset(), false);
+        } else if (requestHeader != null && "LMQ".equalsIgnoreCase(requestHeader.getOffsetType())) {
+            Set<String> groups = null;
+            if (StringUtils.isNotBlank(requestHeader.getGroupList())) {
+                String[] groupArray = requestHeader.getGroupList().split(",");
+                groups = new HashSet<>(groupArray.length);
+                for (String g : groupArray) {
+                    if (StringUtils.isNotBlank(g)) {
+                        groups.add(g.trim());
                     }
                 }
             }
             long since = requestHeader.getSinceTimestamp() == null ? 0L : requestHeader.getSinceTimestamp();
-            content = RemotingSerializable.toJson(this.brokerController.getConsumerOffsetManager().encodeByTopicAndSince(topics, since), false);
+            content = RemotingSerializable.toJson(this.brokerController.getConsumerOffsetManager().encodeLmqByGroupAndSince(groups, since), false);
         } else {
             content = this.brokerController.getConsumerOffsetManager().encode();
         }

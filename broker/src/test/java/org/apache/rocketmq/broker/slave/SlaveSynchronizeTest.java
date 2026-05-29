@@ -33,7 +33,9 @@ import org.apache.rocketmq.broker.subscription.SubscriptionGroupManager;
 import org.apache.rocketmq.broker.topic.TopicConfigManager;
 import org.apache.rocketmq.client.exception.MQBrokerException;
 import org.apache.rocketmq.common.BrokerConfig;
+import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.TopicConfig;
+import org.apache.rocketmq.common.lite.LiteUtil;
 import org.apache.rocketmq.remoting.exception.RemotingCommandException;
 import org.apache.rocketmq.remoting.exception.RemotingConnectException;
 import org.apache.rocketmq.remoting.exception.RemotingSendRequestException;
@@ -151,8 +153,8 @@ public class SlaveSynchronizeTest {
         when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
 
         when(brokerOuterAPI.getAllTopicConfig(anyString())).thenReturn(createTopicConfigWrapper(newTopicConfig));
-        // In new implementation, offset synchronization uses incremental interface by topic
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(createConsumerOffsetWrapper());
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(createConsumerOffsetWrapper());
+        when(consumerOffsetManager.getDataVersion()).thenReturn(createChangedDataVersion());
         when(brokerOuterAPI.getAllDelayOffset(anyString())).thenReturn("");
         when(brokerOuterAPI.getAllSubscriptionGroupConfig(anyString())).thenReturn(createSubscriptionGroupWrapper());
         when(brokerOuterAPI.getAllMessageRequestMode(anyString())).thenReturn(createMessageRequestModeWrapper());
@@ -182,15 +184,15 @@ public class SlaveSynchronizeTest {
         wrapper.setOffsetTable(offsetTable);
         wrapper.setDataVersion(new DataVersion());
 
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(wrapper);
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(wrapper);
 
         // Invoke only syncConsumerOffset to avoid dependency on other syncXxx behaviors
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
         method.setAccessible(true);
         method.invoke(slaveSynchronize);
 
-        // For new master, offsets should be merged incrementally into local table and cleanup should run once.
-        verify(consumerOffsetManager, times(2)).getOffsetTable();
+        // Normal offsets should be replaced by normal-only full snapshot and cleanup should run once.
+        verify(consumerOffsetManager, times(1)).setOffsetTable(any(ConcurrentHashMap.class));
         verify(consumerOffsetManager, times(1)).persist();
     }
 
@@ -215,14 +217,14 @@ public class SlaveSynchronizeTest {
         dataVersion.setStateVersion(2L);
         fullWrapper.setDataVersion(dataVersion);
 
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(fullWrapper);
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(fullWrapper);
 
         // Invoke only syncConsumerOffset to avoid dependency on other syncXxx behaviors
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
         method.setAccessible(true);
         method.invoke(slaveSynchronize);
 
-        // For old master, should be treated as full snapshot and overwrite local table via setOffsetTable
+        // Normal offsets are synced as full normal-only snapshot and overwrite local table via setOffsetTable
         verify(consumerOffsetManager, times(1)).setOffsetTable(any(ConcurrentHashMap.class));
         verify(consumerOffsetManager, times(1)).persist();
     }
@@ -257,7 +259,11 @@ public class SlaveSynchronizeTest {
         when(consumerOffsetManager.getOffsetTable()).thenReturn(new ConcurrentHashMap<>());
 
         org.mockito.ArgumentCaptor<Long> sinceCaptor = org.mockito.ArgumentCaptor.forClass(Long.class);
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), sinceCaptor.capture()))
+        ConcurrentHashMap<String, SubscriptionGroupConfig> subscriptionGroups = new ConcurrentHashMap<>();
+        subscriptionGroups.put("G1", new SubscriptionGroupConfig());
+        when(subscriptionGroupManager.getSubscriptionGroupTable()).thenReturn(subscriptionGroups);
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(new ConsumerOffsetSerializeWrapper());
+        when(brokerOuterAPI.getLmqConsumerOffsetByGroupBatch(anyString(), any(List.class), sinceCaptor.capture()))
             .thenReturn(wrapper);
 
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
@@ -299,7 +305,11 @@ public class SlaveSynchronizeTest {
         when(consumerOffsetManager.getOffsetTable()).thenReturn(new ConcurrentHashMap<>());
 
         org.mockito.ArgumentCaptor<Long> sinceCaptor = org.mockito.ArgumentCaptor.forClass(Long.class);
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), sinceCaptor.capture()))
+        ConcurrentHashMap<String, SubscriptionGroupConfig> subscriptionGroups = new ConcurrentHashMap<>();
+        subscriptionGroups.put("G1", new SubscriptionGroupConfig());
+        when(subscriptionGroupManager.getSubscriptionGroupTable()).thenReturn(subscriptionGroups);
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(new ConsumerOffsetSerializeWrapper());
+        when(brokerOuterAPI.getLmqConsumerOffsetByGroupBatch(anyString(), any(List.class), sinceCaptor.capture()))
             .thenReturn(wrapper);
 
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
@@ -312,12 +322,12 @@ public class SlaveSynchronizeTest {
 
     @Test
     public void testSyncConsumerOffsetBatchesTopicsByConfiguredSize() throws Exception {
-        // Build five topics
-        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        // Build five groups
+        ConcurrentHashMap<String, SubscriptionGroupConfig> subscriptionGroups = new ConcurrentHashMap<>();
         for (int i = 0; i < 5; i++) {
-            topicTable.put("topic" + i, new TopicConfig("topic" + i));
+            subscriptionGroups.put("G" + i, new SubscriptionGroupConfig());
         }
-        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+        when(subscriptionGroupManager.getSubscriptionGroupTable()).thenReturn(subscriptionGroups);
 
         // Set batch size = 2
         BrokerConfig brokerConfig = brokerController.getBrokerConfig();
@@ -326,32 +336,33 @@ public class SlaveSynchronizeTest {
         when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
         when(consumerOffsetManager.getOffsetTable()).thenReturn(new ConcurrentHashMap<>());
 
-        // Stub master to always return offsets that belong to the current batch
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(new ConsumerOffsetSerializeWrapper());
+        // Stub master to always return offsets that belong to the current group batch
         org.mockito.stubbing.Answer<ConsumerOffsetSerializeWrapper> answer = invocation -> {
             @SuppressWarnings("unchecked")
-            List<String> batchTopics = (List<String>) invocation.getArgument(1);
+            List<String> batchGroups = (List<String>) invocation.getArgument(1);
             ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
             ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
             ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
             offsets.put(0, 100L);
-            if (!batchTopics.isEmpty()) {
-                offsetTable.put(batchTopics.get(0) + "@G1", offsets);
+            if (!batchGroups.isEmpty()) {
+                offsetTable.put("%LMQ%T@" + batchGroups.get(0), offsets);
             }
             wrapper.setOffsetTable(offsetTable);
             wrapper.setDataVersion(new DataVersion());
             return wrapper;
         };
 
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong()))
+        when(brokerOuterAPI.getLmqConsumerOffsetByGroupBatch(anyString(), any(List.class), anyLong()))
             .thenAnswer(answer);
 
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
         method.setAccessible(true);
         method.invoke(slaveSynchronize);
 
-        // For 5 topics and batch size 2, should be invoked 3 times
+        // For 5 groups and batch size 2, should be invoked 3 times
         org.mockito.Mockito.verify(brokerOuterAPI, org.mockito.Mockito.times(3))
-            .getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong());
+            .getLmqConsumerOffsetByGroupBatch(anyString(), any(List.class), anyLong());
     }
 
     @Test
@@ -374,6 +385,12 @@ public class SlaveSynchronizeTest {
         when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
         when(consumerOffsetManager.getOffsetTable()).thenReturn(localOffsetTable);
         org.mockito.Mockito.doAnswer(invocation -> {
+            ConcurrentMap<String, ConcurrentMap<Integer, Long>> newOffsetTable = invocation.getArgument(0);
+            localOffsetTable.clear();
+            localOffsetTable.putAll(newOffsetTable);
+            return null;
+        }).when(consumerOffsetManager).setOffsetTable(any(ConcurrentHashMap.class));
+        org.mockito.Mockito.doAnswer(invocation -> {
             String topic = invocation.getArgument(0);
             localOffsetTable.keySet().removeIf(key -> key.startsWith(topic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR));
             return null;
@@ -388,7 +405,7 @@ public class SlaveSynchronizeTest {
         wrapper.setOffsetTable(remoteOffsets);
         wrapper.setDataVersion(new DataVersion());
 
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(wrapper);
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(wrapper);
 
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
         method.setAccessible(true);
@@ -403,7 +420,7 @@ public class SlaveSynchronizeTest {
     }
 
     @Test
-    public void testSyncConsumerOffsetKeepsOffsetsForExistingButNotUpdatedTopics() throws Exception {
+    public void testSyncConsumerOffsetReplacesNormalOffsetsWhenMasterSnapshotDoesNotContainTopic() throws Exception {
         // topicConfigTable contains topicA so it is treated as existing
         ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
         topicTable.put("topicA", new TopicConfig("topicA"));
@@ -417,22 +434,127 @@ public class SlaveSynchronizeTest {
 
         when(brokerController.getConsumerOffsetManager()).thenReturn(consumerOffsetManager);
         when(consumerOffsetManager.getOffsetTable()).thenReturn(localOffsetTable);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            ConcurrentMap<String, ConcurrentMap<Integer, Long>> newOffsetTable = invocation.getArgument(0);
+            localOffsetTable.clear();
+            localOffsetTable.putAll(newOffsetTable);
+            return null;
+        }).when(consumerOffsetManager).setOffsetTable(any(ConcurrentHashMap.class));
 
-        // Master has no new offsets for topicA in this incremental window
+        // Master returns a full normal-only snapshot without topicA
         ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
         wrapper.setOffsetTable(new ConcurrentHashMap<>());
         wrapper.setDataVersion(new DataVersion());
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(wrapper);
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(wrapper);
 
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
         method.setAccessible(true);
         method.invoke(slaveSynchronize);
 
-        // Offsets for topicA should still exist and keep original value
-        Assert.assertTrue(localOffsetTable.containsKey("topicA@G1"));
-        Assert.assertEquals(100L, localOffsetTable.get("topicA@G1").get(0).longValue());
-        // No removal should be triggered for topicA
+        // Normal offsets are replaced by the full normal-only snapshot.
+        Assert.assertFalse(localOffsetTable.containsKey("topicA@G1"));
+        // Topic cleanup is not responsible for topicA because the topic still exists.
         verify(consumerOffsetManager, times(0)).removeConsumerOffset("topicA@G1");
+    }
+
+    @Test
+    public void testSyncConsumerOffsetReplacesNormalOffsetsAndPreservesLocalLmqOffsets() throws Exception {
+        String lmqParentTopic = "lmqParentTopic";
+        String lmqTopic = LiteUtil.toLmqName(lmqParentTopic, "LiteTopic");
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put("remoteNormalTopic", new TopicConfig("remoteNormalTopic"));
+        topicTable.put("staleNormalTopic", new TopicConfig("staleNormalTopic"));
+        topicTable.put(lmqParentTopic, new TopicConfig(lmqParentTopic));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> localOffsetTable = new ConcurrentHashMap<>();
+        localOffsetTable.put("staleNormalTopic@G1", offsetMap(0, 10L));
+        localOffsetTable.put(lmqTopic + "@G1", offsetMap(0, 20L));
+        when(consumerOffsetManager.getOffsetTable()).thenReturn(localOffsetTable);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            ConcurrentMap<String, ConcurrentMap<Integer, Long>> newOffsetTable = invocation.getArgument(0);
+            localOffsetTable.clear();
+            localOffsetTable.putAll(newOffsetTable);
+            return null;
+        }).when(consumerOffsetManager).setOffsetTable(any(ConcurrentHashMap.class));
+
+        ConsumerOffsetSerializeWrapper normalWrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> remoteNormalOffsets = new ConcurrentHashMap<>();
+        remoteNormalOffsets.put("remoteNormalTopic@G1", offsetMap(0, 100L));
+        normalWrapper.setOffsetTable(remoteNormalOffsets);
+        normalWrapper.setDataVersion(new DataVersion());
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(normalWrapper);
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        Assert.assertFalse(localOffsetTable.containsKey("staleNormalTopic@G1"));
+        Assert.assertEquals(100L, localOffsetTable.get("remoteNormalTopic@G1").get(0).longValue());
+        Assert.assertEquals(20L, localOffsetTable.get(lmqTopic + "@G1").get(0).longValue());
+    }
+
+    @Test
+    public void testSyncConsumerOffsetMergesLmqOffsetsThroughCommitOffset() throws Exception {
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put("normalTopic", new TopicConfig("normalTopic"));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        ConcurrentHashMap<String, SubscriptionGroupConfig> subscriptionGroups = new ConcurrentHashMap<>();
+        subscriptionGroups.put("G1", new SubscriptionGroupConfig());
+        when(subscriptionGroupManager.getSubscriptionGroupTable()).thenReturn(subscriptionGroups);
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(new ConsumerOffsetSerializeWrapper());
+
+        String lmqTopic = MixAll.LMQ_PREFIX + "LiteTopic";
+        ConsumerOffsetSerializeWrapper lmqWrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> lmqOffsets = new ConcurrentHashMap<>();
+        lmqOffsets.put(lmqTopic + "@G1", offsetMap(0, 333L));
+        lmqWrapper.setOffsetTable(lmqOffsets);
+        lmqWrapper.setDataVersion(new DataVersion());
+        when(brokerOuterAPI.getLmqConsumerOffsetByGroupBatch(anyString(), any(List.class), anyLong()))
+            .thenReturn(lmqWrapper);
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        verify(consumerOffsetManager, times(1)).commitOffset(null, "G1", lmqTopic, 0, 333L);
+    }
+
+    @Test
+    public void testSyncConsumerOffsetCleansLmqOffsetsByParentTopicExistence() throws Exception {
+        String parentTopic = "parentTopic";
+        String existingLmqTopic = LiteUtil.toLmqName(parentTopic, "childTopic");
+        String deletedLmqTopic = LiteUtil.toLmqName("deletedParentTopic", "childTopic");
+        ConcurrentHashMap<String, TopicConfig> topicTable = new ConcurrentHashMap<>();
+        topicTable.put(parentTopic, new TopicConfig(parentTopic));
+        when(topicConfigManager.getTopicConfigTable()).thenReturn(topicTable);
+
+        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> localOffsetTable = new ConcurrentHashMap<>();
+        localOffsetTable.put(existingLmqTopic + "@G1", offsetMap(0, 100L));
+        localOffsetTable.put(deletedLmqTopic + "@G1", offsetMap(0, 200L));
+        when(consumerOffsetManager.getOffsetTable()).thenReturn(localOffsetTable);
+        org.mockito.Mockito.doAnswer(invocation -> {
+            String topic = invocation.getArgument(0);
+            localOffsetTable.keySet().removeIf(key -> key.startsWith(topic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR));
+            return null;
+        }).when(consumerOffsetManager).cleanOffsetByTopic(anyString());
+        org.mockito.Mockito.doAnswer(invocation -> {
+            ConcurrentMap<String, ConcurrentMap<Integer, Long>> newOffsetTable = invocation.getArgument(0);
+            localOffsetTable.clear();
+            localOffsetTable.putAll(newOffsetTable);
+            return null;
+        }).when(consumerOffsetManager).setOffsetTable(any(ConcurrentHashMap.class));
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(new ConsumerOffsetSerializeWrapper());
+
+        Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
+        method.setAccessible(true);
+        method.invoke(slaveSynchronize);
+
+        Assert.assertTrue(localOffsetTable.containsKey(existingLmqTopic + "@G1"));
+        Assert.assertFalse(localOffsetTable.containsKey(deletedLmqTopic + "@G1"));
+        verify(consumerOffsetManager, times(0)).cleanOffsetByTopic(existingLmqTopic);
+        verify(consumerOffsetManager, times(1)).cleanOffsetByTopic(deletedLmqTopic);
     }
 
     @Test
@@ -452,7 +574,7 @@ public class SlaveSynchronizeTest {
         method.setAccessible(true);
         method.invoke(slaveSynchronize);
 
-        verify(brokerOuterAPI, times(0)).getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong());
+        verify(brokerOuterAPI, times(1)).getNormalConsumerOffset(anyString());
         verify(consumerOffsetManager, times(1)).cleanOffsetByTopic("deletedTopic");
         verify(consumerOffsetManager, times(1)).persist();
     }
@@ -474,7 +596,7 @@ public class SlaveSynchronizeTest {
         ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
         wrapper.setOffsetTable(new ConcurrentHashMap<>());
         wrapper.setDataVersion(new DataVersion());
-        when(brokerOuterAPI.getConsumerOffsetByTopicBatch(anyString(), any(List.class), anyLong())).thenReturn(wrapper);
+        when(brokerOuterAPI.getNormalConsumerOffset(anyString())).thenReturn(wrapper);
 
         Method method = SlaveSynchronize.class.getDeclaredMethod("syncConsumerOffset");
         method.setAccessible(true);
@@ -631,6 +753,12 @@ public class SlaveSynchronizeTest {
         dataVersion.setStateVersion(1L);
         wrapper.setDataVersion(dataVersion);
         return wrapper;
+    }
+
+    private ConcurrentMap<Integer, Long> offsetMap(int queueId, long offset) {
+        ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
+        offsets.put(queueId, offset);
+        return offsets;
     }
 
     private SubscriptionGroupWrapper createSubscriptionGroupWrapper() {

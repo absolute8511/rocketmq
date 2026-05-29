@@ -19,7 +19,6 @@ package org.apache.rocketmq.broker.config.v2;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
@@ -214,7 +213,7 @@ public class ConsumerOffsetManagerV2Test {
     }
 
     @Test
-    public void testCommitOffset_RecordsTimestampForIncrementalSync() {
+    public void testCommitOffset_RecordsGroupTimestampForIncrementalSync() {
         Assert.assertTrue(consumerOffsetManagerV2.load());
 
         String clientHost = "localhost";
@@ -224,11 +223,11 @@ public class ConsumerOffsetManagerV2Test {
         long queueOffset = 100;
         consumerOffsetManagerV2.commitOffset(clientHost, group, topic, queueId, queueOffset);
 
-        Assert.assertTrue(consumerOffsetManagerV2.getTopicOffsetUpdateTimestampTable().containsKey(topic));
+        Assert.assertTrue(consumerOffsetManagerV2.getGroupOffsetUpdateTimestampTable().containsKey(group));
     }
 
     @Test
-    public void testEncodeByTopicAndSince_IncludesLmqOffsetsFromRocksDB() {
+    public void testEncodeLmqByGroupAndSince_IncludesLmqOffsetsFromRocksDB() {
         Assert.assertTrue(consumerOffsetManagerV2.load());
 
         String clientHost = "localhost";
@@ -238,8 +237,8 @@ public class ConsumerOffsetManagerV2Test {
         long queueOffset = 100;
         consumerOffsetManagerV2.commitOffset(clientHost, group, topic, queueId, queueOffset);
 
-        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManagerV2.encodeByTopicAndSince(
-            Collections.singleton(topic), 0);
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManagerV2.encodeLmqByGroupAndSince(
+            new HashSet<String>() {{ add(group); }}, 0);
         Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
 
         Assert.assertEquals(queueOffset,
@@ -247,7 +246,7 @@ public class ConsumerOffsetManagerV2Test {
     }
 
     @Test
-    public void testEncodeByTopicAndSince_FiltersLiteTopicByParentAndInclusiveTimestamp() {
+    public void testEncodeLmqByGroupAndSince_FiltersByGroupAndInclusiveTimestamp() {
         Assert.assertTrue(consumerOffsetManagerV2.load());
 
         String clientHost = "localhost";
@@ -258,16 +257,59 @@ public class ConsumerOffsetManagerV2Test {
         long queueOffset = 100;
         consumerOffsetManagerV2.commitOffset(clientHost, group, liteTopic, queueId, queueOffset);
 
-        Long lastUpdate = consumerOffsetManagerV2.getTopicOffsetUpdateTimestampTable().get(parentTopic);
+        Long lastUpdate = consumerOffsetManagerV2.getGroupOffsetUpdateTimestampTable().get(group);
         Assert.assertNotNull(lastUpdate);
 
-        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManagerV2.encodeByTopicAndSince(
-            new HashSet<String>() {{ add(parentTopic); }}, lastUpdate);
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManagerV2.encodeLmqByGroupAndSince(
+            new HashSet<String>() {{ add(group); }}, lastUpdate);
         Assert.assertTrue(wrapper.getOffsetTable().containsKey(liteTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + group));
 
-        ConsumerOffsetSerializeWrapper filteredWrapper = consumerOffsetManagerV2.encodeByTopicAndSince(
-            new HashSet<String>() {{ add(parentTopic); }}, lastUpdate + 1);
+        ConsumerOffsetSerializeWrapper filteredWrapper = consumerOffsetManagerV2.encodeLmqByGroupAndSince(
+            new HashSet<String>() {{ add(group); }}, lastUpdate + 1);
         Assert.assertFalse(filteredWrapper.getOffsetTable().containsKey(liteTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + group));
+    }
+
+    @Test
+    public void testEncodeLmqByGroupAndSince_RangeScanDoesNotMatchGroupPrefix() {
+        Assert.assertTrue(consumerOffsetManagerV2.load());
+
+        String clientHost = "localhost";
+        String lmqTopic = MixAll.LMQ_PREFIX + "T1";
+        String normalTopic = "T1";
+        int queueId = 1;
+        consumerOffsetManagerV2.commitOffset(clientHost, "G1", lmqTopic, queueId, 100L);
+        consumerOffsetManagerV2.commitOffset(clientHost, "G10", lmqTopic, queueId, 200L);
+        consumerOffsetManagerV2.commitOffset(clientHost, "G1", normalTopic, queueId, 300L);
+
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManagerV2.encodeLmqByGroupAndSince(
+            new HashSet<String>() {{ add("G1"); }}, 0);
+        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
+
+        Assert.assertTrue(result.containsKey(lmqTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G1"));
+        Assert.assertEquals(100L,
+            result.get(lmqTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G1").get(queueId).longValue());
+        Assert.assertFalse(result.containsKey(lmqTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G10"));
+        Assert.assertFalse(result.containsKey(normalTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G1"));
+    }
+
+    @Test
+    public void testEncodeLmqByGroupAndSince_NullGroupsScansAllLmqGroups() {
+        Assert.assertTrue(consumerOffsetManagerV2.load());
+
+        String clientHost = "localhost";
+        String lmqTopic = MixAll.LMQ_PREFIX + "T1";
+        String normalTopic = "T1";
+        int queueId = 1;
+        consumerOffsetManagerV2.commitOffset(clientHost, "G1", lmqTopic, queueId, 100L);
+        consumerOffsetManagerV2.commitOffset(clientHost, "G2", lmqTopic, queueId, 200L);
+        consumerOffsetManagerV2.commitOffset(clientHost, "G1", normalTopic, queueId, 300L);
+
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManagerV2.encodeLmqByGroupAndSince(null, 0);
+        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
+
+        Assert.assertTrue(result.containsKey(lmqTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G1"));
+        Assert.assertTrue(result.containsKey(lmqTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G2"));
+        Assert.assertFalse(result.containsKey(normalTopic + ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR + "G1"));
     }
 
 }

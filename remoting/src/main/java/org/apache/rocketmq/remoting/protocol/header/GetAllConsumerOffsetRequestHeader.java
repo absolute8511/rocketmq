@@ -29,18 +29,23 @@ import org.apache.rocketmq.remoting.protocol.RequestCode;
  * Request header for GET_ALL_CONSUMER_OFFSET.
  * <p>
  * It is backward compatible with the legacy implementation where no
- * custom header is carried. When {@code topicList} and
- * {@code sinceTimestamp} are both empty, the broker should fall back
- * to full offset snapshot.
+ * custom header is carried. When no {@code offsetType} is specified,
+ * the broker should fall back to full offset snapshot.
  */
 @RocketMQAction(value = RequestCode.GET_ALL_CONSUMER_OFFSET, resource = ResourceType.TOPIC, action = Action.GET)
 public class GetAllConsumerOffsetRequestHeader implements CommandCustomHeader {
 
     /**
-     * Optional topic list for batching, separated by comma.
+     * Optional group list for batching, separated by comma.
      */
     @CFNullable
-    private String topicList;
+    private String groupList;
+
+    /**
+     * Optional offset sync type. Supported values are NORMAL and LMQ.
+     */
+    @CFNullable
+    private String offsetType;
 
     /**
      * Optional lower bound timestamp (inclusive) for recently updated
@@ -55,12 +60,20 @@ public class GetAllConsumerOffsetRequestHeader implements CommandCustomHeader {
         // nothing
     }
 
-    public String getTopicList() {
-        return topicList;
+    public String getGroupList() {
+        return groupList;
     }
 
-    public void setTopicList(String topicList) {
-        this.topicList = topicList;
+    public void setGroupList(String groupList) {
+        this.groupList = groupList;
+    }
+
+    public String getOffsetType() {
+        return offsetType;
+    }
+
+    public void setOffsetType(String offsetType) {
+        this.offsetType = offsetType;
     }
 
     public Long getSinceTimestamp() {
@@ -71,4 +84,3 @@ public class GetAllConsumerOffsetRequestHeader implements CommandCustomHeader {
         this.sinceTimestamp = sinceTimestamp;
     }
 }
-

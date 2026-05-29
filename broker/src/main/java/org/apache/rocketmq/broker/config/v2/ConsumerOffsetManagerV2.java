@@ -220,69 +220,13 @@ public class ConsumerOffsetManagerV2 extends ConsumerOffsetManager {
             long stateMachineVersion = messageStore != null ? messageStore.getStateMachineVersion() : 0;
             ConfigHelper.stampDataVersion(writeBatch, TableId.CONSUMER_OFFSET, dataVersion, stateMachineVersion);
             configStorage.write(writeBatch);
-            recordTopicOffsetUpdateTimestamp(topic);
+            recordGroupOffsetUpdateTimestamp(group);
         } catch (RocksDBException e) {
             LOG.error("Failed to commit consumer offset", e);
         } finally {
             keyBuf.release();
             valueBuf.release();
         }
-    }
-
-    @Override
-    public ConsumerOffsetSerializeWrapper encodeByTopicAndSince(final Set<String> topics, final long sinceTimestamp) {
-        ConsumerOffsetSerializeWrapper wrapper = super.encodeByTopicAndSince(topics, sinceTimestamp);
-        ConcurrentMap<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
-
-        // Non-LMQ offsets are mirrored in memory and have already been encoded by super.
-        // LMQ offsets are stored only in RocksDB, so they need to be scanned from RocksDB here.
-        ByteBuf beginKeyBuf = AbstractRocksDBStorage.POOLED_ALLOCATOR.buffer(4);
-        beginKeyBuf.writeByte(TablePrefix.TABLE.getValue());
-        beginKeyBuf.writeShort(TableId.CONSUMER_OFFSET.getValue());
-        beginKeyBuf.writeByte(RecordPrefix.DATA.getValue());
-
-        ByteBuf endKeyBuf = AbstractRocksDBStorage.POOLED_ALLOCATOR.buffer(4);
-        endKeyBuf.writeByte(TablePrefix.TABLE.getValue());
-        endKeyBuf.writeShort(TableId.CONSUMER_OFFSET.getValue());
-        endKeyBuf.writeByte(RecordPrefix.DATA.getValue() + 1);
-
-        try (RocksIterator iterator = configStorage.iterate(beginKeyBuf.nioBuffer(), endKeyBuf.nioBuffer())) {
-            int keyCapacity = 256;
-            ByteBuffer keyBuffer = ByteBuffer.allocateDirect(keyCapacity);
-            ByteBuffer valueBuffer = ByteBuffer.allocateDirect(Long.BYTES);
-            try {
-                while (iterator.isValid()) {
-                    keyBuffer.clear();
-                    valueBuffer.clear();
-
-                    int len = iterator.key(keyBuffer);
-                    if (len > keyCapacity) {
-                        keyCapacity = len;
-                        PlatformDependent.freeDirectBuffer(keyBuffer);
-                        keyBuffer = ByteBuffer.allocateDirect(keyCapacity);
-                        continue;
-                    }
-                    len = iterator.value(valueBuffer);
-                    assert len == Long.BYTES;
-
-                    ConsumerOffsetRecord record = parseConsumerOffsetRecord(keyBuffer, valueBuffer);
-                    if (MixAll.isLmq(record.topic) && shouldEncodeOffset(record.topic, topics, sinceTimestamp)) {
-                        String topicAtGroup = record.topic + TOPIC_GROUP_SEPARATOR + record.group;
-                        result.computeIfAbsent(topicAtGroup, ignored -> new ConcurrentHashMap<>())
-                            .put(record.queueId, record.offset);
-                    }
-                    iterator.next();
-                }
-            } finally {
-                PlatformDependent.freeDirectBuffer(keyBuffer);
-                PlatformDependent.freeDirectBuffer(valueBuffer);
-            }
-        } finally {
-            beginKeyBuf.release();
-            endKeyBuf.release();
-        }
-
-        return wrapper;
     }
 
     private ByteBuf keyOfConsumerOffset(String group, String topic, int queueId) {
@@ -325,6 +269,115 @@ public class ConsumerOffsetManagerV2 extends ConsumerOffsetManager {
         keyBuf.writeByte(AbstractRocksDBStorage.CTRL_1);
         keyBuf.writeInt(queueId);
         return keyBuf;
+    }
+
+    private ByteBuf beginKeyOfConsumerOffset(String group) {
+        if (group == null) {
+            ByteBuf keyBuf = AbstractRocksDBStorage.POOLED_ALLOCATOR.buffer(4);
+            keyBuf.writeByte(TablePrefix.TABLE.getValue());
+            keyBuf.writeShort(TableId.CONSUMER_OFFSET.getValue());
+            keyBuf.writeByte(RecordPrefix.DATA.getValue());
+            return keyBuf;
+        }
+
+        byte[] groupBytes = group.getBytes(StandardCharsets.UTF_8);
+        int keyLen = 1 /*table prefix*/ + Short.BYTES /*table-id*/ + 1 /*record-prefix*/
+            + Short.BYTES /*group-len*/ + groupBytes.length + 1 /*CTRL_1*/;
+        ByteBuf keyBuf = AbstractRocksDBStorage.POOLED_ALLOCATOR.buffer(keyLen);
+        keyBuf.writeByte(TablePrefix.TABLE.getValue());
+        keyBuf.writeShort(TableId.CONSUMER_OFFSET.getValue());
+        keyBuf.writeByte(RecordPrefix.DATA.getValue());
+        keyBuf.writeShort(groupBytes.length);
+        keyBuf.writeBytes(groupBytes);
+        keyBuf.writeByte(AbstractRocksDBStorage.CTRL_1);
+        return keyBuf;
+    }
+
+    private ByteBuf endKeyOfConsumerOffset(String group) {
+        if (group == null) {
+            ByteBuf keyBuf = AbstractRocksDBStorage.POOLED_ALLOCATOR.buffer(4);
+            keyBuf.writeByte(TablePrefix.TABLE.getValue());
+            keyBuf.writeShort(TableId.CONSUMER_OFFSET.getValue());
+            keyBuf.writeByte(RecordPrefix.DATA.getValue() + 1);
+            return keyBuf;
+        }
+
+        byte[] groupBytes = group.getBytes(StandardCharsets.UTF_8);
+        int keyLen = 1 /*table prefix*/ + Short.BYTES /*table-id*/ + 1 /*record-prefix*/
+            + Short.BYTES /*group-len*/ + groupBytes.length + 1 /*CTRL_2*/;
+        ByteBuf keyBuf = AbstractRocksDBStorage.POOLED_ALLOCATOR.buffer(keyLen);
+        keyBuf.writeByte(TablePrefix.TABLE.getValue());
+        keyBuf.writeShort(TableId.CONSUMER_OFFSET.getValue());
+        keyBuf.writeByte(RecordPrefix.DATA.getValue());
+        keyBuf.writeShort(groupBytes.length);
+        keyBuf.writeBytes(groupBytes);
+        keyBuf.writeByte(AbstractRocksDBStorage.CTRL_2);
+        return keyBuf;
+    }
+
+    @Override
+    public ConsumerOffsetSerializeWrapper encodeLmqByGroupAndSince(final Set<String> groups, final long sinceTimestamp) {
+        ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
+        if (result == null) {
+            result = new ConcurrentHashMap<>();
+            wrapper.setOffsetTable(result);
+        }
+
+        if (groups == null || groups.isEmpty()) {
+            scanLmqOffsetByGroup(null, sinceTimestamp, result);
+        } else {
+            for (String group : groups) {
+                scanLmqOffsetByGroup(group, sinceTimestamp, result);
+            }
+        }
+        wrapper.setDataVersion(this.dataVersion);
+        return wrapper;
+    }
+
+    private void scanLmqOffsetByGroup(String group, long sinceTimestamp,
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> result) {
+        if (group != null && !shouldEncodeOffsetByGroup(group, null, sinceTimestamp)) {
+            return;
+        }
+
+        ByteBuf beginKeyBuf = beginKeyOfConsumerOffset(group);
+        ByteBuf endKeyBuf = endKeyOfConsumerOffset(group);
+        try (RocksIterator iterator = configStorage.iterate(beginKeyBuf.nioBuffer(), endKeyBuf.nioBuffer())) {
+            int keyCapacity = 256;
+            ByteBuffer keyBuffer = ByteBuffer.allocateDirect(keyCapacity);
+            ByteBuffer valueBuffer = ByteBuffer.allocateDirect(Long.BYTES);
+            try {
+                while (iterator.isValid()) {
+                    keyBuffer.clear();
+                    valueBuffer.clear();
+
+                    int len = iterator.key(keyBuffer);
+                    if (len > keyCapacity) {
+                        keyCapacity = len;
+                        PlatformDependent.freeDirectBuffer(keyBuffer);
+                        keyBuffer = ByteBuffer.allocateDirect(keyCapacity);
+                        continue;
+                    }
+                    len = iterator.value(valueBuffer);
+                    assert len == Long.BYTES;
+
+                    ConsumerOffsetRecord record = parseConsumerOffsetRecord(keyBuffer, valueBuffer);
+                    if (MixAll.isLmq(record.topic) && shouldEncodeOffsetByGroup(record.group, null, sinceTimestamp)) {
+                        String topicAtGroup = record.topic + TOPIC_GROUP_SEPARATOR + record.group;
+                        result.computeIfAbsent(topicAtGroup, ignored -> new ConcurrentHashMap<>())
+                            .put(record.queueId, record.offset);
+                    }
+                    iterator.next();
+                }
+            } finally {
+                PlatformDependent.freeDirectBuffer(keyBuffer);
+                PlatformDependent.freeDirectBuffer(valueBuffer);
+            }
+        } finally {
+            beginKeyBuf.release();
+            endKeyBuf.release();
+        }
     }
 
     @Override

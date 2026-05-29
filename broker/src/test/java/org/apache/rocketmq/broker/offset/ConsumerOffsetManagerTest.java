@@ -24,6 +24,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import org.apache.rocketmq.broker.BrokerController;
 import org.apache.rocketmq.common.BrokerConfig;
+import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.remoting.protocol.body.ConsumerOffsetSerializeWrapper;
 import org.apache.rocketmq.store.config.MessageStoreConfig;
 import org.junit.Assert;
@@ -105,131 +106,7 @@ public class ConsumerOffsetManagerTest {
     }
 
     @Test
-    public void testEncodeByTopicAndSince_filtersByTopicsAndTimestamp() {
-        // Prepare offsetTable: topicA@G1, topicB@G1, topicC@G2
-        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
-        ConcurrentMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
-        offsetsA.put(0, 10L);
-        offsetTable.put("topicA" + TOPIC_GROUP_SEPARATOR + "G1", offsetsA);
-
-        ConcurrentMap<Integer, Long> offsetsB = new ConcurrentHashMap<>();
-        offsetsB.put(0, 20L);
-        offsetTable.put("topicB" + TOPIC_GROUP_SEPARATOR + "G1", offsetsB);
-
-        ConcurrentMap<Integer, Long> offsetsC = new ConcurrentHashMap<>();
-        offsetsC.put(0, 30L);
-        offsetTable.put("topicC" + TOPIC_GROUP_SEPARATOR + "G2", offsetsC);
-
-        consumerOffsetManager.setOffsetTable(offsetTable);
-
-        // Simulate timestamps: topicA earlier, topicB newer, topicC without timestamp
-        long base = System.currentTimeMillis();
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().clear();
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicA", base - 10_000);
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicB", base);
-
-        // Only request topicA/B, sinceTimestamp between their timestamps
-        Set<String> topics = new HashSet<>();
-        topics.add("topicA");
-        topics.add("topicB");
-        long since = base - 5_000;
-
-        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeByTopicAndSince(topics, since);
-        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
-
-        // topicA last update is earlier than since, should be filtered
-        assertThat(result).doesNotContainKey("topicA" + TOPIC_GROUP_SEPARATOR + "G1");
-        // topicB matches topic and timestamp constraints, should be kept
-        assertThat(result).containsKey("topicB" + TOPIC_GROUP_SEPARATOR + "G1");
-        // topicC is not in whitelist, should be filtered
-        assertThat(result).doesNotContainKey("topicC" + TOPIC_GROUP_SEPARATOR + "G2");
-    }
-
-    @Test
-    public void testEncodeByTopicAndSince_keepsWhenTimestampEqualsSince() {
-        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
-        ConcurrentMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
-        offsetsA.put(0, 10L);
-        offsetTable.put("topicA" + TOPIC_GROUP_SEPARATOR + "G1", offsetsA);
-
-        consumerOffsetManager.setOffsetTable(offsetTable);
-
-        long base = System.currentTimeMillis();
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().clear();
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicA", base);
-
-        Set<String> topics = new HashSet<>();
-        topics.add("topicA");
-
-        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeByTopicAndSince(topics, base);
-        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
-
-        // sinceTimestamp is an inclusive lower bound, so lastUpdate == sinceTimestamp should be kept
-        assertThat(result).containsKey("topicA" + TOPIC_GROUP_SEPARATOR + "G1");
-    }
-
-    @Test
-    public void testEncodeByTopicAndSince_noTopicsTreatsAsAllTopics() {
-        // Build two records that are all recently updated
-        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
-        ConcurrentMap<Integer, Long> offsetsA = new ConcurrentHashMap<>();
-        offsetsA.put(0, 10L);
-        offsetTable.put("topicA" + TOPIC_GROUP_SEPARATOR + "G1", offsetsA);
-
-        ConcurrentMap<Integer, Long> offsetsB = new ConcurrentHashMap<>();
-        offsetsB.put(0, 20L);
-        offsetTable.put("topicB" + TOPIC_GROUP_SEPARATOR + "G2", offsetsB);
-        consumerOffsetManager.setOffsetTable(offsetTable);
-
-        long now = System.currentTimeMillis();
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().clear();
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicA", now);
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put("topicB", now);
-
-        // topics is null and sinceTimestamp<=0, treat as full snapshot
-        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeByTopicAndSince(null, 0);
-        assertThat(wrapper.getOffsetTable()).hasSize(2);
-    }
-
-    @Test
-    public void testEncodeByTopicAndSince_filtersLiteTopicByParentTimestamp() {
-        // Build a lite topic (backed by LMQ) whose parent topic is parentTopic
-        String parentTopic = "parentTopic";
-        String liteTopic = "%LMQ%$" + parentTopic + "$child";
-
-        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
-        ConcurrentMap<Integer, Long> offsetsLite = new ConcurrentHashMap<>();
-        offsetsLite.put(0, 10L);
-        offsetTable.put(liteTopic + TOPIC_GROUP_SEPARATOR + "G1", offsetsLite);
-
-        consumerOffsetManager.setOffsetTable(offsetTable);
-
-        long base = System.currentTimeMillis();
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().clear();
-        // Only record last update timestamp for parent topic
-        consumerOffsetManager.getTopicOffsetUpdateTimestampTable().put(parentTopic, base);
-
-        // 1) since < parent last update timestamp, lite topic should be kept
-        ConsumerOffsetSerializeWrapper wrapper1 = consumerOffsetManager.encodeByTopicAndSince(
-            new HashSet<String>() {{ add(parentTopic); }}, base - 1_000);
-        Map<String, ConcurrentMap<Integer, Long>> result1 = wrapper1.getOffsetTable();
-        assertThat(result1).containsKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
-
-        // 2) since == parent last update timestamp, lite topic should still be kept because since is inclusive
-        ConsumerOffsetSerializeWrapper wrapper2 = consumerOffsetManager.encodeByTopicAndSince(
-            new HashSet<String>() {{ add(parentTopic); }}, base);
-        Map<String, ConcurrentMap<Integer, Long>> result2 = wrapper2.getOffsetTable();
-        assertThat(result2).containsKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
-
-        // 3) since > parent last update timestamp, lite topic should be filtered out
-        ConsumerOffsetSerializeWrapper wrapper3 = consumerOffsetManager.encodeByTopicAndSince(
-            new HashSet<String>() {{ add(parentTopic); }}, base + 1_000);
-        Map<String, ConcurrentMap<Integer, Long>> result3 = wrapper3.getOffsetTable();
-        assertThat(result3).doesNotContainKey(liteTopic + TOPIC_GROUP_SEPARATOR + "G1");
-    }
-
-    @Test
-    public void testCleanOffsetByTopic_cleansAllOffsetTablesAndTimestamp() {
+    public void testCleanOffsetByTopic_cleansAllOffsetTables() {
         String topic = "TopicName";
         String group = "GroupName";
         Mockito.when(brokerController.getBrokerConfig()).thenReturn(new BrokerConfig());
@@ -240,13 +117,80 @@ public class ConsumerOffsetManagerTest {
         Assert.assertEquals(100L, consumerOffsetManager.queryOffset(group, topic, 0));
         Assert.assertTrue(consumerOffsetManager.hasOffsetReset(topic, group, 1));
         Assert.assertEquals(300L, consumerOffsetManager.queryPullOffset(group, topic, 2));
-        Assert.assertTrue(consumerOffsetManager.getTopicOffsetUpdateTimestampTable().containsKey(topic));
 
         consumerOffsetManager.cleanOffsetByTopic(topic);
 
         Assert.assertEquals(-1L, consumerOffsetManager.queryOffset(group, topic, 0));
         Assert.assertFalse(consumerOffsetManager.hasOffsetReset(topic, group, 1));
         Assert.assertEquals(-1L, consumerOffsetManager.queryPullOffset(group, topic, 2));
-        Assert.assertFalse(consumerOffsetManager.getTopicOffsetUpdateTimestampTable().containsKey(topic));
+    }
+
+    @Test
+    public void testEncodeNormalOffset_excludesLmqOffsets() {
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        ConcurrentMap<Integer, Long> normalOffsets = new ConcurrentHashMap<>();
+        normalOffsets.put(0, 10L);
+        offsetTable.put("normalTopic" + TOPIC_GROUP_SEPARATOR + "G1", normalOffsets);
+
+        ConcurrentMap<Integer, Long> lmqOffsets = new ConcurrentHashMap<>();
+        lmqOffsets.put(0, 20L);
+        String lmqTopic = MixAll.LMQ_PREFIX + "liteTopic";
+        offsetTable.put(lmqTopic + TOPIC_GROUP_SEPARATOR + "G1", lmqOffsets);
+        consumerOffsetManager.setOffsetTable(offsetTable);
+
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeNormalOffset();
+
+        assertThat(wrapper.getOffsetTable()).containsOnlyKeys("normalTopic" + TOPIC_GROUP_SEPARATOR + "G1");
+        Assert.assertEquals(10L, wrapper.getOffsetTable().get("normalTopic" + TOPIC_GROUP_SEPARATOR + "G1").get(0).longValue());
+    }
+
+    @Test
+    public void testEncodeLmqByGroupAndSince_filtersByGroupAndTimestamp() {
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        String lmqTopic = MixAll.LMQ_PREFIX + "liteTopic";
+        offsetTable.put(lmqTopic + TOPIC_GROUP_SEPARATOR + "G1", offsetMap(0, 10L));
+        offsetTable.put(lmqTopic + TOPIC_GROUP_SEPARATOR + "G2", offsetMap(0, 20L));
+        offsetTable.put(lmqTopic + TOPIC_GROUP_SEPARATOR + "G3", offsetMap(0, 30L));
+        offsetTable.put("normalTopic" + TOPIC_GROUP_SEPARATOR + "G1", offsetMap(0, 40L));
+        consumerOffsetManager.setOffsetTable(offsetTable);
+
+        long now = System.currentTimeMillis();
+        consumerOffsetManager.getGroupOffsetUpdateTimestampTable().clear();
+        consumerOffsetManager.getGroupOffsetUpdateTimestampTable().put("G1", now);
+        consumerOffsetManager.getGroupOffsetUpdateTimestampTable().put("G2", now - 10_000);
+
+        Set<String> groups = new HashSet<>();
+        groups.add("G1");
+        groups.add("G2");
+        groups.add("G3");
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeLmqByGroupAndSince(groups, now - 5_000);
+        Map<String, ConcurrentMap<Integer, Long>> result = wrapper.getOffsetTable();
+
+        assertThat(result).containsKey(lmqTopic + TOPIC_GROUP_SEPARATOR + "G1");
+        assertThat(result).doesNotContainKey(lmqTopic + TOPIC_GROUP_SEPARATOR + "G2");
+        assertThat(result).containsKey(lmqTopic + TOPIC_GROUP_SEPARATOR + "G3");
+        assertThat(result).doesNotContainKey("normalTopic" + TOPIC_GROUP_SEPARATOR + "G1");
+    }
+
+    @Test
+    public void testEncodeLmqByGroupAndSince_nullGroupsTreatsAsAllGroups() {
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable = new ConcurrentHashMap<>();
+        String lmqTopic = MixAll.LMQ_PREFIX + "liteTopic";
+        offsetTable.put(lmqTopic + TOPIC_GROUP_SEPARATOR + "G1", offsetMap(0, 10L));
+        offsetTable.put(lmqTopic + TOPIC_GROUP_SEPARATOR + "G2", offsetMap(0, 20L));
+        offsetTable.put("normalTopic" + TOPIC_GROUP_SEPARATOR + "G1", offsetMap(0, 30L));
+        consumerOffsetManager.setOffsetTable(offsetTable);
+
+        ConsumerOffsetSerializeWrapper wrapper = consumerOffsetManager.encodeLmqByGroupAndSince(null, 0);
+
+        assertThat(wrapper.getOffsetTable()).containsOnlyKeys(
+            lmqTopic + TOPIC_GROUP_SEPARATOR + "G1",
+            lmqTopic + TOPIC_GROUP_SEPARATOR + "G2");
+    }
+
+    private ConcurrentMap<Integer, Long> offsetMap(int queueId, long offset) {
+        ConcurrentMap<Integer, Long> offsets = new ConcurrentHashMap<>();
+        offsets.put(queueId, offset);
+        return offsets;
     }
 }

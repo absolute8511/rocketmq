@@ -903,13 +903,35 @@ public class BrokerOuterAPI {
         throw new MQBrokerException(response.getCode(), response.getRemark(), addr);
     }
 
-    public ConsumerOffsetSerializeWrapper getConsumerOffsetByTopicBatch(
-        final String addr, final List<String> topics, final long sinceTimestamp) throws InterruptedException,
+    public ConsumerOffsetSerializeWrapper getNormalConsumerOffset(
+        final String addr) throws InterruptedException, RemotingTimeoutException,
+        RemotingSendRequestException, RemotingConnectException, MQBrokerException {
+
+        GetAllConsumerOffsetRequestHeader requestHeader = new GetAllConsumerOffsetRequestHeader();
+        requestHeader.setOffsetType("NORMAL");
+
+        RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ALL_CONSUMER_OFFSET, requestHeader);
+        RemotingCommand response = this.remotingClient.invokeSync(addr, request, 3000);
+        assert response != null;
+        switch (response.getCode()) {
+            case ResponseCode.SUCCESS: {
+                return ConsumerOffsetSerializeWrapper.decode(response.getBody(), ConsumerOffsetSerializeWrapper.class);
+            }
+            default:
+                break;
+        }
+
+        throw new MQBrokerException(response.getCode(), response.getRemark(), addr);
+    }
+
+    public ConsumerOffsetSerializeWrapper getLmqConsumerOffsetByGroupBatch(
+        final String addr, final List<String> groups, final long sinceTimestamp) throws InterruptedException,
         RemotingTimeoutException, RemotingSendRequestException, RemotingConnectException, MQBrokerException {
 
         GetAllConsumerOffsetRequestHeader requestHeader = new GetAllConsumerOffsetRequestHeader();
-        if (topics != null && !topics.isEmpty()) {
-            requestHeader.setTopicList(String.join(",", topics));
+        requestHeader.setOffsetType("LMQ");
+        if (groups != null && !groups.isEmpty()) {
+            requestHeader.setGroupList(String.join(",", groups));
         }
         if (sinceTimestamp > 0) {
             requestHeader.setSinceTimestamp(sinceTimestamp);

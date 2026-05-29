@@ -164,13 +164,11 @@ public class SlaveSynchronize {
             // excessively large safety gap.
             long syncStartTime = System.currentTimeMillis();
 
-            // Collect all topics known on this broker (after topic config sync).
             ConcurrentMap<String, TopicConfig> topicConfigTable = this.brokerController.getTopicConfigManager().getTopicConfigTable();
             if (topicConfigTable == null) {
                 return;
             }
 
-            List<String> allTopics = new ArrayList<>(topicConfigTable.keySet());
             int batchSize = this.brokerController.getBrokerConfig().getSyncConsumerOffsetBatchTopicNum();
             if (batchSize <= 0) {
                 batchSize = 100;
@@ -194,51 +192,45 @@ public class SlaveSynchronize {
             // cleaning group offsets on slave.
             Set<String> syncedGroupsThisRound = new HashSet<>();
 
-            for (int i = 0; i < allTopics.size(); i += batchSize) {
-                int end = Math.min(i + batchSize, allTopics.size());
-                List<String> batchTopics = allTopics.subList(i, end);
+            // Clean deleted topics against the local table before the normal
+            // full snapshot replacement. Otherwise deleted normal topics would
+            // disappear from offsetTable after setOffsetTable(), making it
+            // impossible to call cleanOffsetByTopic() for related reset / pull
+            // offset tables.
+            cleanupOrphanConsumerOffsets(consumerOffsetManager, topicConfigTable);
 
-                ConsumerOffsetSerializeWrapper offsetWrapper =
-                    this.brokerController.getBrokerOuterAPI().getConsumerOffsetByTopicBatch(masterAddrBak, batchTopics, since);
-                if (offsetWrapper == null || offsetWrapper.getOffsetTable() == null || offsetWrapper.getOffsetTable().isEmpty()) {
-                    continue;
-                }
-
-                collectOffsetGroupsFromWrapper(offsetWrapper, syncedGroupsThisRound);
-
-                // Backward compatibility for old masters:
-                // Old masters do not understand topic / time based
-                // incremental parameters and always return the full
-                // offset snapshot. In that case, treating the result
-                // as incremental would still be logically correct but
-                // unnecessarily expensive because we keep merging a
-                // large offset table. Here we check whether the
-                // response contains topics beyond the requested batch
-                // to detect such old masters:
-                // - New master: only returns offsets related to
-                //   requested topics (and their LMQ children).
-                // - Old master: returns offsets for all topics.
-                if (isFullOffsetSnapshotFromOldMaster(offsetWrapper, batchTopics)) {
-                    // Use the full snapshot from master to overwrite
-                    // local offsets once, then stop this sync loop.
-                    consumerOffsetManager.setOffsetTable(new ConcurrentHashMap<>(offsetWrapper.getOffsetTable()));
-                    if (offsetWrapper.getDataVersion() != null) {
-                        consumerOffsetManager.getDataVersion().assignNewOne(offsetWrapper.getDataVersion());
-                    }
-                    break;
-                }
-
-                consumerOffsetManager.getOffsetTable().putAll(offsetWrapper.getOffsetTable());
-                if (offsetWrapper.getDataVersion() != null) {
-                    consumerOffsetManager.getDataVersion().assignNewOne(offsetWrapper.getDataVersion());
+            // Normal-topic offsets are small and mirrored in memory on master.
+            // Fetch them as a full normal-only snapshot every round to keep the
+            // original full-sync semantics without mixing in massive LMQ data.
+            ConsumerOffsetSerializeWrapper normalOffsetWrapper =
+                this.brokerController.getBrokerOuterAPI().getNormalConsumerOffset(masterAddrBak);
+            if (normalOffsetWrapper != null && normalOffsetWrapper.getOffsetTable() != null) {
+                replaceNormalOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable());
+                collectOffsetGroupsFromWrapper(normalOffsetWrapper, syncedGroupsThisRound);
+                if (normalOffsetWrapper.getDataVersion() != null) {
+                    consumerOffsetManager.getDataVersion().assignNewOne(normalOffsetWrapper.getDataVersion());
                 }
             }
 
-            // After merging incremental offsets from master, we need to
-            // clean up local offsets whose topics have been deleted on
-            // this broker. Topics that still exist but simply have no
-            // recent updates must be kept.
-            cleanupOrphanConsumerOffsets(consumerOffsetManager, topicConfigTable);
+            ConcurrentMap<String, SubscriptionGroupConfig> subscriptionGroupTable =
+                this.brokerController.getSubscriptionGroupManager().getSubscriptionGroupTable();
+            List<String> allGroups = subscriptionGroupTable == null ? Collections.emptyList() : new ArrayList<>(subscriptionGroupTable.keySet());
+            for (int i = 0; i < allGroups.size(); i += batchSize) {
+                int end = Math.min(i + batchSize, allGroups.size());
+                List<String> batchGroups = allGroups.subList(i, end);
+
+                ConsumerOffsetSerializeWrapper lmqOffsetWrapper =
+                    this.brokerController.getBrokerOuterAPI().getLmqConsumerOffsetByGroupBatch(masterAddrBak, batchGroups, since);
+                if (lmqOffsetWrapper == null || lmqOffsetWrapper.getOffsetTable() == null || lmqOffsetWrapper.getOffsetTable().isEmpty()) {
+                    continue;
+                }
+
+                collectOffsetGroupsFromWrapper(lmqOffsetWrapper, syncedGroupsThisRound);
+                mergeOffsetWrapper(consumerOffsetManager, lmqOffsetWrapper);
+                if (lmqOffsetWrapper.getDataVersion() != null) {
+                    consumerOffsetManager.getDataVersion().assignNewOne(lmqOffsetWrapper.getDataVersion());
+                }
+            }
 
             // Update guardrail view for subscription-group cleanup to
             // reflect what master returned in this sync round.
@@ -251,69 +243,34 @@ public class SlaveSynchronize {
             // safety gap, this avoids missing updates that happened
             // while this sync was in progress.
             this.lastConsumerOffsetSyncTimestamp = syncStartTime;
-            LOGGER.info("Update slave consumer offset from master incrementally, master={}, topics={}, sinceTimestamp={}, safeGapMillis={}, baseTimestamp={}",
-                masterAddrBak, allTopics.size(), since, safeGap, sinceBase);
+            LOGGER.info("Update slave consumer offset from master, master={}, normalTopics={}, lmqGroups={}, sinceTimestamp={}, safeGapMillis={}, baseTimestamp={}",
+                masterAddrBak, topicConfigTable.size(), allGroups.size(), since, safeGap, sinceBase);
         } catch (Exception e) {
             LOGGER.error("SyncConsumerOffset Exception, {}", masterAddrBak, e);
         }
     }
 
-    /**
-     * Detect whether the given wrapper from master is effectively a
-     * full offset snapshot instead of a topic-filtered one.
-     * <p>
-     * New masters honor {@code topicList} / {@code sinceTimestamp}
-     * and will only return offsets that "belong to" the requested
-     * {@code batchTopics} (including LMQ / lite child topics whose
-     * parent is in the list). Old masters ignore these parameters and
-     * always return the whole offset table. We leverage this
-     * difference to detect old masters and downgrade our behavior.
-     */
-    private boolean isFullOffsetSnapshotFromOldMaster(ConsumerOffsetSerializeWrapper wrapper, List<String> batchTopics) {
-        if (wrapper == null || wrapper.getOffsetTable() == null || wrapper.getOffsetTable().isEmpty()) {
-            return false;
-        }
-        if (batchTopics == null || batchTopics.isEmpty()) {
-            // No topic filter means the caller explicitly asks for a
-            // full snapshot.
-            return true;
-        }
-
-        // Build topic whitelist for this batch.
-        Set<String> requestedTopics = new HashSet<>(batchTopics);
-
-        for (String topicAtGroup : wrapper.getOffsetTable().keySet()) {
-            int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
-            String topic = idx > 0 ? topicAtGroup.substring(0, idx) : topicAtGroup;
-
-            boolean match = false;
-            // Normal topics must appear in batchTopics.
-            if (requestedTopics.contains(topic)) {
-                match = true;
-            } else if (MixAll.isLmq(topic)) {
-                // For LMQ / lite topics, as long as the parent topic
-                // appears in batchTopics, treat it as belonging to
-                // this batch.
-                for (String parent : requestedTopics) {
-                    if (LiteUtil.belongsTo(topic, parent)) {
-                        match = true;
-                        break;
-                    }
+    private void replaceNormalOffsets(ConsumerOffsetManager consumerOffsetManager,
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> normalOffsetTable) {
+        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> newOffsetTable = new ConcurrentHashMap<>(normalOffsetTable);
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> currentOffsetTable = consumerOffsetManager.getOffsetTable();
+        if (currentOffsetTable != null) {
+            for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : currentOffsetTable.entrySet()) {
+                String topicAtGroup = entry.getKey();
+                if (topicAtGroup == null) {
+                    continue;
+                }
+                int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
+                if (idx <= 0) {
+                    continue;
+                }
+                String topic = topicAtGroup.substring(0, idx);
+                if (MixAll.isLmq(topic)) {
+                    newOffsetTable.put(topicAtGroup, entry.getValue());
                 }
             }
-
-            if (!match) {
-                // Found a topic that does not belong to this batch,
-                // which implies master did not filter by topic and is
-                // very likely an old version. Treat it as a full
-                // snapshot.
-                return true;
-            }
         }
-
-        // All topics are within the batch; treat as incremental
-        // snapshot.
-        return false;
+        consumerOffsetManager.setOffsetTable(newOffsetTable);
     }
 
     private void collectOffsetGroupsFromWrapper(ConsumerOffsetSerializeWrapper wrapper, Set<String> groups) {
@@ -336,6 +293,27 @@ public class SlaveSynchronize {
             String group = topicAtGroup.substring(idx + 1);
             if (!group.isEmpty()) {
                 groups.add(group);
+            }
+        }
+    }
+
+    private void mergeOffsetWrapper(ConsumerOffsetManager consumerOffsetManager, ConsumerOffsetSerializeWrapper wrapper) {
+        if (consumerOffsetManager == null || wrapper == null || wrapper.getOffsetTable() == null) {
+            return;
+        }
+        for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : wrapper.getOffsetTable().entrySet()) {
+            String topicAtGroup = entry.getKey();
+            if (topicAtGroup == null) {
+                continue;
+            }
+            int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
+            if (idx <= 0 || idx >= topicAtGroup.length() - 1) {
+                continue;
+            }
+            String topic = topicAtGroup.substring(0, idx);
+            String group = topicAtGroup.substring(idx + 1);
+            for (Map.Entry<Integer, Long> offsetEntry : entry.getValue().entrySet()) {
+                consumerOffsetManager.commitOffset(null, group, topic, offsetEntry.getKey(), offsetEntry.getValue());
             }
         }
     }
@@ -373,8 +351,7 @@ public class SlaveSynchronize {
 
             String topic = topicAtGroup.substring(0, idx);
             String topicForMatch = topic;
-            // For lite topics backed by LMQ, we align with
-            // encodeByTopicAndSince and use parent topic when
+            // For lite topics backed by LMQ, use parent topic when
             // determining whether the topic still exists.
             if (MixAll.isLmq(topic)) {
                 String parentTopic = LiteUtil.getParentTopic(topic);

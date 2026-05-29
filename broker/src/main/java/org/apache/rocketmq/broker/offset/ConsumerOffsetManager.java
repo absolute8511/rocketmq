@@ -34,7 +34,6 @@ import org.apache.rocketmq.common.ConfigManager;
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.UtilAll;
 import org.apache.rocketmq.common.constant.LoggerName;
-import org.apache.rocketmq.common.lite.LiteUtil;
 import org.apache.rocketmq.logging.org.slf4j.Logger;
 import org.apache.rocketmq.logging.org.slf4j.LoggerFactory;
 import org.apache.rocketmq.remoting.protocol.DataVersion;
@@ -51,12 +50,12 @@ public class ConsumerOffsetManager extends ConfigManager {
         new ConcurrentHashMap<>(512);
 
     /**
-     * Record last update timestamp for each topic so that master can
-     * quickly decide whether to include offsets of this topic when
-     * serving incremental snapshot for slave sync. This table is
-     * in-memory only and does not need to be persisted.
+     * Record last update timestamp for each group so that LMQ offsets can be
+     * synchronized incrementally by group. This table is in-memory only; for
+     * groups without recorded timestamp, keep their offsets to avoid missing
+     * data after restart.
      */
-    private final ConcurrentMap<String/* topic */, Long> topicOffsetUpdateTimestampTable =
+    private final ConcurrentMap<String/* group */, Long> groupOffsetUpdateTimestampTable =
         new ConcurrentHashMap<>(512);
 
     protected final ConcurrentMap<String, ConcurrentMap<Integer, Long>> resetOffsetTable =
@@ -100,7 +99,6 @@ public class ConsumerOffsetManager extends ConfigManager {
         cleanOffsetTableByTopic(this.offsetTable, topic, true);
         cleanOffsetTableByTopic(this.pullOffsetTable, topic, false);
         cleanOffsetTableByTopic(this.resetOffsetTable, topic, false);
-        this.topicOffsetUpdateTimestampTable.remove(getTopicForTimestamp(topic));
     }
 
     private void cleanOffsetTableByTopic(ConcurrentMap<String, ConcurrentMap<Integer, Long>> table, String topic,
@@ -234,32 +232,17 @@ public class ConsumerOffsetManager extends ConfigManager {
             }
         }
         int idx = key.indexOf(TOPIC_GROUP_SEPARATOR);
-        String topic = idx > 0 ? key.substring(0, idx) : key;
-        recordTopicOffsetUpdateTimestamp(topic);
+        String group = idx > 0 && idx < key.length() - 1 ? key.substring(idx + 1) : null;
+        recordGroupOffsetUpdateTimestamp(group);
         if (versionChangeCounter.incrementAndGet() % brokerController.getBrokerConfig().getConsumerOffsetUpdateVersionStep() == 0) {
             updateDataVersion();
         }
     }
 
-    protected void recordTopicOffsetUpdateTimestamp(String topic) {
-        this.topicOffsetUpdateTimestampTable.put(getTopicForTimestamp(topic), System.currentTimeMillis());
-    }
-
-    protected String getTopicForTimestamp(String topic) {
-        // For lite topics (backed by LMQ), use the parent topic as
-        // the granularity for last-update timestamp:
-        // - Normal topics: record timestamp by topic name directly.
-        // - LMQ / lite topics: resolve parent topic and update its
-        //   timestamp whenever any child lite topic offset changes,
-        //   so that incremental sync works on parent-topic level.
-        String topicForTimestamp = topic;
-        if (MixAll.isLmq(topic)) {
-            String parentTopic = LiteUtil.getParentTopic(topic);
-            if (parentTopic != null) {
-                topicForTimestamp = parentTopic;
-            }
+    protected void recordGroupOffsetUpdateTimestamp(String group) {
+        if (group != null) {
+            this.groupOffsetUpdateTimestampTable.put(group, System.currentTimeMillis());
         }
-        return topicForTimestamp;
     }
 
     public void commitPullOffset(final String clientHost, final String group, final String topic, final int queueId,
@@ -356,28 +339,20 @@ public class ConsumerOffsetManager extends ConfigManager {
     }
 
     /**
-     * Encode part of offsetTable according to topics and last update time.
-     *
-     * @param topics        topic white list, null or empty means all topics
-     * @param sinceTimestamp lower bound of last update time (inclusive). When
-     *                       {@code sinceTimestamp} is &lt;= 0, no time filter is applied.
+     * Encode normal topic offsets only. LMQ offsets are synchronized separately
+     * by group to avoid mixing a very large LMQ offset table into the regular
+     * full snapshot.
      */
-    public ConsumerOffsetSerializeWrapper encodeByTopicAndSince(final Set<String> topics, final long sinceTimestamp) {
+    public ConsumerOffsetSerializeWrapper encodeNormalOffset() {
         ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> result = new ConcurrentHashMap<>();
 
         for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : this.offsetTable.entrySet()) {
             String topicAtGroup = entry.getKey();
             String[] arrays = topicAtGroup.split(TOPIC_GROUP_SEPARATOR);
-            if (arrays.length != 2) {
+            if (arrays.length != 2 || MixAll.isLmq(arrays[0])) {
                 continue;
             }
-            String topic = arrays[0];
-
-            if (!shouldEncodeOffset(topic, topics, sinceTimestamp)) {
-                continue;
-            }
-
             result.put(topicAtGroup, new ConcurrentHashMap<>(entry.getValue()));
         }
 
@@ -386,50 +361,38 @@ public class ConsumerOffsetManager extends ConfigManager {
         return wrapper;
     }
 
-    protected boolean shouldEncodeOffset(String topic, Set<String> topics, long sinceTimestamp) {
-        // Topic filter rules:
-        // 1. When topics is null or empty: do not filter; include
-        //    all topics (including LMQ / lite topics).
-        // 2. For normal topics: topic itself must be in the
-        //    whitelist.
-        // 3. For LMQ / lite topics: use parent topic to decide
-        //    whether to include; only offsets whose parent topic
-        //    appears in the whitelist will be encoded.
-        if (topics != null && !topics.isEmpty()) {
-            boolean match = false;
-            if (!MixAll.isLmq(topic)) {
-                // Normal topic: match by topic name directly
-                match = topics.contains(topic);
-            } else {
-                // LMQ / lite topic: use parent topic as matching granularity
-                if (topics.contains(topic)) {
-                    // Compatibility: whitelist already contains this LMQ name
-                    match = true;
-                } else {
-                    for (String parentTopic : topics) {
-                        if (LiteUtil.belongsTo(topic, parentTopic)) {
-                            match = true;
-                            break;
-                        }
-                    }
-                }
-            }
+    /**
+     * Encode LMQ offsets by consumer group and update time. This default
+     * implementation scans the in-memory offset table; RocksDB based managers
+     * can override it with group-prefix range scan.
+     */
+    public ConsumerOffsetSerializeWrapper encodeLmqByGroupAndSince(final Set<String> groups, final long sinceTimestamp) {
+        ConsumerOffsetSerializeWrapper wrapper = new ConsumerOffsetSerializeWrapper();
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> result = new ConcurrentHashMap<>();
 
-            if (!match) {
-                return false;
+        for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : this.offsetTable.entrySet()) {
+            String topicAtGroup = entry.getKey();
+            String[] arrays = topicAtGroup.split(TOPIC_GROUP_SEPARATOR);
+            if (arrays.length != 2 || !MixAll.isLmq(arrays[0])) {
+                continue;
             }
+            if (!shouldEncodeOffsetByGroup(arrays[1], groups, sinceTimestamp)) {
+                continue;
+            }
+            result.put(topicAtGroup, new ConcurrentHashMap<>(entry.getValue()));
         }
 
-        // Time filtering: keep consistent with how timestamps are recorded in commitOffset
-        // - Normal topic: filter by topic itself
-        // - LMQ / lite topic: filter by parent topic
+        wrapper.setOffsetTable(result);
+        wrapper.setDataVersion(this.dataVersion);
+        return wrapper;
+    }
+
+    protected boolean shouldEncodeOffsetByGroup(String group, Set<String> groups, long sinceTimestamp) {
+        if (groups != null && !groups.isEmpty() && !groups.contains(group)) {
+            return false;
+        }
         if (sinceTimestamp > 0) {
-            Long lastUpdate = this.topicOffsetUpdateTimestampTable.get(getTopicForTimestamp(topic));
-            // If we have a recorded timestamp that is older than sinceTimestamp,
-            // we can safely skip all offsets under this topic. For topics without
-            // a recorded timestamp (for example, old data reloaded after restart),
-            // keep them to avoid missing any updates. Equality is kept because
-            // sinceTimestamp is defined as an inclusive lower bound.
+            Long lastUpdate = this.groupOffsetUpdateTimestampTable.get(group);
             if (lastUpdate != null && lastUpdate < sinceTimestamp) {
                 return false;
             }
@@ -445,8 +408,8 @@ public class ConsumerOffsetManager extends ConfigManager {
         this.offsetTable = offsetTable;
     }
 
-    public ConcurrentMap<String, Long> getTopicOffsetUpdateTimestampTable() {
-        return topicOffsetUpdateTimestampTable;
+    public ConcurrentMap<String, Long> getGroupOffsetUpdateTimestampTable() {
+        return groupOffsetUpdateTimestampTable;
     }
 
     public ConcurrentMap<String, ConcurrentMap<Integer, Long>> getPullOffsetTable() {
