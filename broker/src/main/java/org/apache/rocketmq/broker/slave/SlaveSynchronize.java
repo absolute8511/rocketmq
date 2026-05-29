@@ -193,10 +193,8 @@ public class SlaveSynchronize {
             Set<String> syncedGroupsThisRound = new HashSet<>();
 
             // Clean deleted topics against the local table before the normal
-            // full snapshot replacement. Otherwise deleted normal topics would
-            // disappear from offsetTable after setOffsetTable(), making it
-            // impossible to call cleanOffsetByTopic() for related reset / pull
-            // offset tables.
+            // snapshot merge, so related reset / pull offset tables are also
+            // cleaned through cleanOffsetByTopic().
             cleanupOrphanConsumerOffsets(consumerOffsetManager, topicConfigTable);
 
             // Normal-topic offsets are small and mirrored in memory on master.
@@ -205,7 +203,8 @@ public class SlaveSynchronize {
             ConsumerOffsetSerializeWrapper normalOffsetWrapper =
                 this.brokerController.getBrokerOuterAPI().getNormalConsumerOffset(masterAddrBak);
             if (normalOffsetWrapper != null && normalOffsetWrapper.getOffsetTable() != null) {
-                replaceNormalOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable());
+                cleanupStaleNormalOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable());
+                mergeNormalOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable());
                 collectOffsetGroupsFromWrapper(normalOffsetWrapper, syncedGroupsThisRound);
                 if (normalOffsetWrapper.getDataVersion() != null) {
                     consumerOffsetManager.getDataVersion().assignNewOne(normalOffsetWrapper.getDataVersion());
@@ -250,43 +249,70 @@ public class SlaveSynchronize {
         }
     }
 
-    private void replaceNormalOffsets(ConsumerOffsetManager consumerOffsetManager,
+    private void mergeNormalOffsets(ConsumerOffsetManager consumerOffsetManager,
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> normalOffsetTable) {
-        ConcurrentHashMap<String, ConcurrentMap<Integer, Long>> newOffsetTable = new ConcurrentHashMap<>();
-        if (normalOffsetTable != null) {
-            for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : normalOffsetTable.entrySet()) {
-                String topicAtGroup = entry.getKey();
-                if (topicAtGroup == null) {
-                    continue;
-                }
-                int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
-                if (idx <= 0) {
-                    continue;
-                }
-                String topic = topicAtGroup.substring(0, idx);
-                if (!MixAll.isLmq(topic)) {
-                    newOffsetTable.put(topicAtGroup, entry.getValue());
-                }
+        if (consumerOffsetManager == null || normalOffsetTable == null) {
+            return;
+        }
+        for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : normalOffsetTable.entrySet()) {
+            TopicGroup topicGroup = parseTopicGroup(entry.getKey());
+            if (topicGroup == null || MixAll.isLmq(topicGroup.topic) || entry.getValue() == null) {
+                continue;
+            }
+            for (Map.Entry<Integer, Long> offsetEntry : entry.getValue().entrySet()) {
+                consumerOffsetManager.commitOffset(null, topicGroup.group, topicGroup.topic,
+                    offsetEntry.getKey(), offsetEntry.getValue());
             }
         }
+    }
+
+    private void cleanupStaleNormalOffsets(ConsumerOffsetManager consumerOffsetManager,
+        ConcurrentMap<String, ConcurrentMap<Integer, Long>> masterNormalOffsetTable) {
+        if (consumerOffsetManager == null || masterNormalOffsetTable == null) {
+            return;
+        }
+
         ConcurrentMap<String, ConcurrentMap<Integer, Long>> currentOffsetTable = consumerOffsetManager.getOffsetTable();
-        if (currentOffsetTable != null) {
-            for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : currentOffsetTable.entrySet()) {
-                String topicAtGroup = entry.getKey();
-                if (topicAtGroup == null) {
-                    continue;
-                }
-                int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
-                if (idx <= 0) {
-                    continue;
-                }
-                String topic = topicAtGroup.substring(0, idx);
-                if (MixAll.isLmq(topic)) {
-                    newOffsetTable.put(topicAtGroup, entry.getValue());
+        if (currentOffsetTable == null || currentOffsetTable.isEmpty()) {
+            return;
+        }
+
+        Set<String> masterNormalOffsets = new HashSet<>();
+        for (String topicAtGroup : masterNormalOffsetTable.keySet()) {
+            TopicGroup topicGroup = parseTopicGroup(topicAtGroup);
+            if (topicGroup != null && !MixAll.isLmq(topicGroup.topic)) {
+                masterNormalOffsets.add(topicAtGroup);
+            }
+        }
+
+        Iterator<Map.Entry<String, ConcurrentMap<Integer, Long>>> iterator = currentOffsetTable.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<String, ConcurrentMap<Integer, Long>> entry = iterator.next();
+            TopicGroup topicGroup = parseTopicGroup(entry.getKey());
+            if (topicGroup == null || MixAll.isLmq(topicGroup.topic)) {
+                continue;
+            }
+            if (!masterNormalOffsets.contains(entry.getKey())) {
+                iterator.remove();
+                consumerOffsetManager.removeConsumerOffset(entry.getKey());
+                LOGGER.info("Clean stale normal consumer offset on slave, topicAtGroup={}", entry.getKey());
+                continue;
+            }
+
+            ConcurrentMap<Integer, Long> masterQueueOffsets = masterNormalOffsetTable.get(entry.getKey());
+            ConcurrentMap<Integer, Long> localQueueOffsets = entry.getValue();
+            if (masterQueueOffsets == null || localQueueOffsets == null) {
+                continue;
+            }
+            for (Integer queueId : localQueueOffsets.keySet()) {
+                if (!masterQueueOffsets.containsKey(queueId)) {
+                    iterator.remove();
+                    consumerOffsetManager.removeConsumerOffset(entry.getKey());
+                    LOGGER.info("Clean stale normal consumer offset queues on slave, topicAtGroup={}", entry.getKey());
+                    break;
                 }
             }
         }
-        consumerOffsetManager.setOffsetTable(newOffsetTable);
     }
 
     private void collectOffsetGroupsFromWrapper(ConsumerOffsetSerializeWrapper wrapper, Set<String> groups) {
@@ -318,22 +344,34 @@ public class SlaveSynchronize {
             return;
         }
         for (Map.Entry<String, ConcurrentMap<Integer, Long>> entry : wrapper.getOffsetTable().entrySet()) {
-            String topicAtGroup = entry.getKey();
-            if (topicAtGroup == null) {
+            TopicGroup topicGroup = parseTopicGroup(entry.getKey());
+            if (topicGroup == null || !MixAll.isLmq(topicGroup.topic) || entry.getValue() == null) {
                 continue;
             }
-            int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
-            if (idx <= 0 || idx >= topicAtGroup.length() - 1) {
-                continue;
-            }
-            String topic = topicAtGroup.substring(0, idx);
-            if (!MixAll.isLmq(topic)) {
-                continue;
-            }
-            String group = topicAtGroup.substring(idx + 1);
             for (Map.Entry<Integer, Long> offsetEntry : entry.getValue().entrySet()) {
-                consumerOffsetManager.commitOffset(null, group, topic, offsetEntry.getKey(), offsetEntry.getValue());
+                consumerOffsetManager.commitOffset(null, topicGroup.group, topicGroup.topic, offsetEntry.getKey(), offsetEntry.getValue());
             }
+        }
+    }
+
+    private TopicGroup parseTopicGroup(String topicAtGroup) {
+        if (topicAtGroup == null) {
+            return null;
+        }
+        int idx = topicAtGroup.indexOf(ConsumerOffsetManager.TOPIC_GROUP_SEPARATOR);
+        if (idx <= 0 || idx >= topicAtGroup.length() - 1) {
+            return null;
+        }
+        return new TopicGroup(topicAtGroup.substring(0, idx), topicAtGroup.substring(idx + 1));
+    }
+
+    private static class TopicGroup {
+        private final String topic;
+        private final String group;
+
+        private TopicGroup(String topic, String group) {
+            this.topic = topic;
+            this.group = group;
         }
     }
 
@@ -438,27 +476,19 @@ public class SlaveSynchronize {
                         String group = configEntry.getKey();
                         if (!newSubscriptionGroupTable.containsKey(group)) {
                             iterator.remove();
-                            // Optionally clean local consumer offsets for
-                            // groups that have been deleted on master.
-                            // As a soft guardrail, if this group still
-                            // appeared in the most recent consumer
-                            // offset sync result from master, we skip
-                            // removing its offsets for now to avoid
-                            // losing offsets that are still present on
-                            // master.
-                            if (this.brokerController.getBrokerConfig().isCleanDeletedSubscriptionGroupOffsetInSlave()
-                                && !lastSyncedConsumerOffsetGroups.contains(group)) {
-                                this.brokerController.getConsumerOffsetManager().removeOffset(group);
-                            }
                         }
                         subscriptionGroupManager.deleteSubscriptionGroupConfig(group);
                     }
                     // update
                     newSubscriptionGroupTable.values().forEach(subscriptionGroupManager::putSubscriptionGroupConfig);
+                    cleanupOffsetsBySubscriptionGroupTable(curSubscriptionGroupTable);
                     subscriptionGroupManager.updateDataVersion();
                     // persist
                     subscriptionGroupManager.persist();
                     LOGGER.info("Update slave Subscription Group from master, {}", masterAddrBak);
+                } else {
+                    cleanupOffsetsBySubscriptionGroupTable(
+                        this.brokerController.getSubscriptionGroupManager().getSubscriptionGroupTable());
                 }
             } catch (Exception e) {
                 LOGGER.error("SyncSubscriptionGroup Exception, {}", masterAddrBak, e);
@@ -489,6 +519,33 @@ public class SlaveSynchronize {
                 LOGGER.info("Update slave Message Request Mode from master, {}", masterAddrBak);
             } catch (Exception e) {
                 LOGGER.error("SyncMessageRequestMode Exception, {}", masterAddrBak, e);
+            }
+        }
+    }
+
+    private void cleanupOffsetsBySubscriptionGroupTable(
+        ConcurrentMap<String, SubscriptionGroupConfig> subscriptionGroupTable) {
+        if (!this.brokerController.getBrokerConfig().isCleanDeletedSubscriptionGroupOffsetInSlave()
+            || subscriptionGroupTable == null) {
+            return;
+        }
+
+        ConsumerOffsetManager consumerOffsetManager = this.brokerController.getConsumerOffsetManager();
+        if (consumerOffsetManager == null || consumerOffsetManager.getOffsetTable() == null) {
+            return;
+        }
+
+        Set<String> offsetGroups = new HashSet<>();
+        for (String topicAtGroup : consumerOffsetManager.getOffsetTable().keySet()) {
+            TopicGroup topicGroup = parseTopicGroup(topicAtGroup);
+            if (topicGroup != null) {
+                offsetGroups.add(topicGroup.group);
+            }
+        }
+
+        for (String group : offsetGroups) {
+            if (!subscriptionGroupTable.containsKey(group) && !lastSyncedConsumerOffsetGroups.contains(group)) {
+                consumerOffsetManager.removeOffset(group);
             }
         }
     }
