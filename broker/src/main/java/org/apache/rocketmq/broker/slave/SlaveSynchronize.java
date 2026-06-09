@@ -202,7 +202,9 @@ public class SlaveSynchronize {
             // original full-sync semantics without mixing in massive LMQ data.
             ConsumerOffsetSerializeWrapper normalOffsetWrapper =
                 this.brokerController.getBrokerOuterAPI().getNormalConsumerOffset(masterAddrBak);
+            boolean legacyFullSnapshotReturned = false;
             if (normalOffsetWrapper != null && normalOffsetWrapper.getOffsetTable() != null) {
+                legacyFullSnapshotReturned = containsOffsetType(normalOffsetWrapper.getOffsetTable(), true);
                 cleanupStaleNormalOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable());
                 mergeOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable(), false);
                 collectOffsetGroupsFromWrapper(normalOffsetWrapper, syncedGroupsThisRound);
@@ -211,10 +213,21 @@ public class SlaveSynchronize {
                 }
             }
 
+            if (legacyFullSnapshotReturned) {
+                // Old masters do not understand the NORMAL / LMQ filter header
+                // and return the full offset snapshot for GET_ALL_CONSUMER_OFFSET.
+                // The normal request above has already fetched all LMQ offsets,
+                // so merge them once and skip the following batched LMQ requests
+                // to avoid repeatedly transferring the same huge full snapshot.
+                mergeOffsets(consumerOffsetManager, normalOffsetWrapper.getOffsetTable(), true);
+                LOGGER.info("Detected legacy full consumer offset snapshot from master normal response, skip batched LMQ offset sync, master={}",
+                    masterAddrBak);
+            }
+
             ConcurrentMap<String, SubscriptionGroupConfig> subscriptionGroupTable =
                 this.brokerController.getSubscriptionGroupManager().getSubscriptionGroupTable();
             List<String> allGroups = subscriptionGroupTable == null ? Collections.emptyList() : new ArrayList<>(subscriptionGroupTable.keySet());
-            for (int i = 0; i < allGroups.size(); i += batchSize) {
+            for (int i = 0; !legacyFullSnapshotReturned && i < allGroups.size(); i += batchSize) {
                 int end = Math.min(i + batchSize, allGroups.size());
                 List<String> batchGroups = allGroups.subList(i, end);
 
@@ -228,6 +241,11 @@ public class SlaveSynchronize {
                 mergeOffsets(consumerOffsetManager, lmqOffsetWrapper.getOffsetTable(), true);
                 if (lmqOffsetWrapper.getDataVersion() != null) {
                     consumerOffsetManager.getDataVersion().assignNewOne(lmqOffsetWrapper.getDataVersion());
+                }
+                if (isLegacyFullSnapshotForLmqBatch(lmqOffsetWrapper.getOffsetTable(), batchGroups)) {
+                    legacyFullSnapshotReturned = true;
+                    LOGGER.info("Detected legacy full consumer offset snapshot from master LMQ response, stop remaining batched LMQ offset sync, master={}, batchGroups={}",
+                        masterAddrBak, batchGroups);
                 }
             }
 
@@ -247,6 +265,40 @@ public class SlaveSynchronize {
         } catch (Exception e) {
             LOGGER.error("SyncConsumerOffset Exception, {}", masterAddrBak, e);
         }
+    }
+
+    private boolean isLegacyFullSnapshotForLmqBatch(ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable,
+        List<String> batchGroups) {
+        if (offsetTable == null || offsetTable.isEmpty()) {
+            return false;
+        }
+        Set<String> requestedGroups = batchGroups == null ? Collections.emptySet() : new HashSet<>(batchGroups);
+        for (String topicAtGroup : offsetTable.keySet()) {
+            TopicGroup topicGroup = parseTopicGroup(topicAtGroup);
+            if (topicGroup == null) {
+                continue;
+            }
+            if (!MixAll.isLmq(topicGroup.topic)) {
+                return true;
+            }
+            if (!requestedGroups.isEmpty() && !requestedGroups.contains(topicGroup.group)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean containsOffsetType(ConcurrentMap<String, ConcurrentMap<Integer, Long>> offsetTable, boolean lmqOffset) {
+        if (offsetTable == null || offsetTable.isEmpty()) {
+            return false;
+        }
+        for (String topicAtGroup : offsetTable.keySet()) {
+            TopicGroup topicGroup = parseTopicGroup(topicAtGroup);
+            if (topicGroup != null && MixAll.isLmq(topicGroup.topic) == lmqOffset) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void mergeOffsets(ConsumerOffsetManager consumerOffsetManager,
