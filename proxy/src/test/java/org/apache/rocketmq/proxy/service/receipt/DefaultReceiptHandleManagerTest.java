@@ -18,6 +18,7 @@
 package org.apache.rocketmq.proxy.service.receipt;
 
 import io.netty.channel.Channel;
+import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.channel.local.LocalChannel;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -116,7 +117,7 @@ public class DefaultReceiptHandleManagerTest extends BaseServiceTest {
             .commitLogOffset(0L)
             .build().encode();
         PROXY_CONTEXT.withVal(ContextVariable.CLIENT_ID, "channel-id");
-        PROXY_CONTEXT.withVal(ContextVariable.CHANNEL, new LocalChannel());
+        PROXY_CONTEXT.withVal(ContextVariable.CHANNEL, new EmbeddedChannel());
         Mockito.doNothing().when(consumerManager).appendConsumerIdsChangeListener(Mockito.any(ConsumerIdsChangeListener.class));
         messageReceiptHandle = new MessageReceiptHandle(GROUP, TOPIC, QUEUE_ID, receiptHandle, MESSAGE_ID, OFFSET,
             RECONSUME_TIMES);
@@ -124,7 +125,7 @@ public class DefaultReceiptHandleManagerTest extends BaseServiceTest {
 
     @Test
     public void testAddReceiptHandle() {
-        Channel channel = new LocalChannel();
+        Channel channel = new EmbeddedChannel();
         receiptHandleManager.addReceiptHandle(PROXY_CONTEXT, channel, GROUP, MSG_ID, messageReceiptHandle);
         Mockito.when(metadataService.getSubscriptionGroupConfig(Mockito.any(), Mockito.eq(GROUP))).thenReturn(new SubscriptionGroupConfig());
         Mockito.when(consumerManager.findChannel(Mockito.eq(GROUP), Mockito.eq(channel))).thenReturn(Mockito.mock(ClientChannelInfo.class));
@@ -462,5 +463,113 @@ public class DefaultReceiptHandleManagerTest extends BaseServiceTest {
         receiptHandleManager.addReceiptHandle(PROXY_CONTEXT, channel, GROUP, MSG_ID, messageReceiptHandle);
         listenerArgumentCaptor.getValue().handle(ConsumerGroupEvent.CLIENT_UNREGISTER, GROUP, new ClientChannelInfo(channel, "", LanguageCode.JAVA, 0));
         assertTrue(receiptHandleManager.receiptHandleGroupMap.isEmpty());
+    }
+
+    /**
+     * Verifies that a channel which is no longer active (e.g., TCP connection closed) but still
+     * registered in ConsumerManager is treated as offline, stopping renewal and clearing the group.
+     * This prevents unbounded renewal for stale channels (Bug 9 / Issue #9805).
+     */
+    @Test
+    public void testClientOfflineWithInactiveChannel() {
+        // LocalChannel is NOT active (not connected), simulating a closed TCP connection
+        Channel inactiveChannel = new LocalChannel();
+
+        ProxyContext ctx = ProxyContext.create();
+        ctx.withVal(ContextVariable.CLIENT_ID, "inactive-channel-id");
+        ctx.withVal(ContextVariable.CHANNEL, inactiveChannel);
+
+        String handle = ReceiptHandle.builder()
+            .startOffset(0L)
+            .retrieveTime(System.currentTimeMillis() - INVISIBLE_TIME + ConfigurationManager.getProxyConfig().getRenewAheadTimeMillis() - 5)
+            .invisibleTime(INVISIBLE_TIME)
+            .reviveQueueId(1)
+            .topicType(ReceiptHandle.NORMAL_TOPIC)
+            .brokerName(BROKER_NAME)
+            .queueId(QUEUE_ID)
+            .offset(OFFSET)
+            .commitLogOffset(0L)
+            .build().encode();
+        MessageReceiptHandle inactiveHandle = new MessageReceiptHandle(GROUP, TOPIC, QUEUE_ID, handle, MESSAGE_ID, OFFSET,
+            RECONSUME_TIMES);
+
+        receiptHandleManager.addReceiptHandle(ctx, inactiveChannel, GROUP, MSG_ID, inactiveHandle);
+
+        // ConsumerManager still has the channel registered (unregister event not yet fired)
+        Mockito.when(consumerManager.findChannel(Mockito.eq(GROUP), Mockito.eq(inactiveChannel)))
+            .thenReturn(Mockito.mock(ClientChannelInfo.class));
+        // Mock changeInvisibleTime for the CLEAR_GROUP event (sets short invisible time for redelivery)
+        Mockito.when(messagingProcessor.changeInvisibleTime(Mockito.any(), Mockito.any(),
+                Mockito.anyString(), Mockito.anyString(), Mockito.anyString(), Mockito.anyLong()))
+            .thenReturn(CompletableFuture.completedFuture(new AckResult()));
+
+        receiptHandleManager.scheduleRenewTask();
+
+        // Group should be cleared since channel is inactive, even though ConsumerManager still has it
+        await().atMost(Duration.ofSeconds(2)).until(() -> {
+            try {
+                ReceiptHandleGroup receiptHandleGroup = receiptHandleManager.receiptHandleGroupMap
+                    .get(new ReceiptHandleGroupKey(inactiveChannel, GROUP));
+                return receiptHandleGroup == null || receiptHandleGroup.isEmpty();
+            } catch (Exception e) {
+                return false;
+            }
+        });
+
+        // Should have been called with clear-time (short duration for redelivery), not regular renewal time
+        Mockito.verify(messagingProcessor, Mockito.timeout(1000).times(1))
+            .changeInvisibleTime(Mockito.any(ProxyContext.class), Mockito.any(ReceiptHandle.class), Mockito.eq(MESSAGE_ID),
+                Mockito.eq(GROUP), Mockito.eq(TOPIC), Mockito.eq(ConfigurationManager.getProxyConfig().getInvisibleTimeMillisWhenClear()));
+    }
+
+    /**
+     * Verifies that when a client holds a message but never acks it, the Proxy keeps renewing
+     * only until renewMaxTimeMillis is reached. After the deadline, renewal stops and a STOP_RENEW
+     * (nack with retry delay) is issued so the message becomes visible again for redelivery.
+     */
+    @Test
+    public void testRenewStopsAtMaxTimeForConnectedNonAckingClient() {
+        long maxRenewMs = ConfigurationManager.getProxyConfig().getRenewMaxTimeMillis();
+        // Simulate a handle that was consumed exactly renewMaxTimeMillis ago (at the boundary)
+        String overdueHandle = ReceiptHandle.builder()
+            .startOffset(0L)
+            .retrieveTime(System.currentTimeMillis() - maxRenewMs)
+            .invisibleTime(200L)
+            .reviveQueueId(1)
+            .topicType(ReceiptHandle.NORMAL_TOPIC)
+            .brokerName(BROKER_NAME)
+            .queueId(QUEUE_ID)
+            .offset(OFFSET)
+            .commitLogOffset(0L)
+            .build().encode();
+        MessageReceiptHandle overdueReceiptHandle = new MessageReceiptHandle(GROUP, TOPIC, QUEUE_ID, overdueHandle,
+            MESSAGE_ID, OFFSET, RECONSUME_TIMES);
+
+        Channel channel = PROXY_CONTEXT.getVal(ContextVariable.CHANNEL);
+        receiptHandleManager.addReceiptHandle(PROXY_CONTEXT, channel, GROUP, MSG_ID, overdueReceiptHandle);
+
+        // Client channel is active and registered – client is "online" but never acks
+        Mockito.when(consumerManager.findChannel(Mockito.eq(GROUP), Mockito.eq(channel)))
+            .thenReturn(Mockito.mock(ClientChannelInfo.class));
+        SubscriptionGroupConfig groupConfig = new SubscriptionGroupConfig();
+        Mockito.when(metadataService.getSubscriptionGroupConfig(Mockito.any(), Mockito.eq(GROUP))).thenReturn(groupConfig);
+        Mockito.when(messagingProcessor.changeInvisibleTime(Mockito.any(), Mockito.any(), Mockito.anyString(),
+                Mockito.anyString(), Mockito.anyString(), Mockito.anyLong()))
+            .thenReturn(CompletableFuture.completedFuture(new AckResult()));
+
+        receiptHandleManager.scheduleRenewTask();
+
+        // Renewal must stop: a STOP_RENEW nack is sent with the retry-policy delay, not the default invisible time
+        long expectedStopDelay = groupConfig.getGroupRetryPolicy().getRetryPolicy().nextDelayDuration(RECONSUME_TIMES);
+        Mockito.verify(messagingProcessor, Mockito.timeout(1000).times(1))
+            .changeInvisibleTime(Mockito.any(ProxyContext.class), Mockito.any(ReceiptHandle.class),
+                Mockito.eq(MESSAGE_ID), Mockito.eq(GROUP), Mockito.eq(TOPIC), Mockito.eq(expectedStopDelay));
+
+        // Handle must be removed from the manager so it is no longer tracked
+        await().atMost(Duration.ofSeconds(1)).untilAsserted(() -> {
+            ReceiptHandleGroup receiptHandleGroup = receiptHandleManager.receiptHandleGroupMap.values().stream()
+                .findFirst().orElseThrow(() -> new AssertionError("expected receipt handle group in map but it was absent"));
+            assertTrue(receiptHandleGroup.isEmpty());
+        });
     }
 }

@@ -16,7 +16,7 @@
  */
 package org.apache.rocketmq.proxy.processor;
 
-import io.netty.channel.local.LocalChannel;
+import io.netty.channel.embedded.EmbeddedChannel;
 import org.apache.rocketmq.broker.client.ClientChannelInfo;
 import org.apache.rocketmq.broker.client.ConsumerManager;
 import org.apache.rocketmq.common.consumer.ReceiptHandle;
@@ -83,7 +83,7 @@ public class ReceiptHandleProcessorTest extends InitConfigTest {
             .commitLogOffset(0L)
             .build().encode();
         PROXY_CONTEXT.withVal(ContextVariable.CLIENT_ID, "channel-id");
-        PROXY_CONTEXT.withVal(ContextVariable.CHANNEL, new LocalChannel());
+        PROXY_CONTEXT.withVal(ContextVariable.CHANNEL, new EmbeddedChannel());
         messageReceiptHandle = new MessageReceiptHandle(CONSUMER_GROUP, TOPIC, QUEUE_ID, receiptHandle, MESSAGE_ID, OFFSET,
             RECONSUME_TIMES);
     }
