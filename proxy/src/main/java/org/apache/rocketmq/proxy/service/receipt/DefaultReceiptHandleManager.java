@@ -223,6 +223,10 @@ public class DefaultReceiptHandleManager extends AbstractStartAndShutdown implem
                     }
                 });
             } else {
+                log.warn("message has been consumed for {}ms which exceeds renewMaxTimeMillis {}ms,"
+                    + " stop auto-renew and trigger retry. group:{}, msgId:{}, handle:{}",
+                    current - messageReceiptHandle.getConsumeTimestamp(), proxyConfig.getRenewMaxTimeMillis(),
+                    messageReceiptHandle.getGroup(), messageReceiptHandle.getMessageId(), messageReceiptHandle);
                 SubscriptionGroupConfig subscriptionGroupConfig =
                     metadataService.getSubscriptionGroupConfig(context, messageReceiptHandle.getGroup());
                 if (subscriptionGroupConfig == null) {

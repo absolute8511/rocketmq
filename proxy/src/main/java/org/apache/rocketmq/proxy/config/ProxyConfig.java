@@ -213,14 +213,56 @@ public class ProxyConfig implements ConfigFile {
     private long longPollingReserveTimeInMillis = 100;
 
     private long invisibleTimeMillisWhenClear = 1000L;
+    /**
+     * Whether to enable the Proxy-side automatic renew (ChangeInvisibleTime) for POP consumed messages.
+     * When enabled (default), the Proxy periodically extends the invisibleTime of unacknowledged messages
+     * so that they remain invisible while the consumer is still processing them. Auto-renew stops when:
+     * <ul>
+     *   <li>The consumer sends an Ack (success) or Nack (failure triggers retry immediately).</li>
+     *   <li>The client channel disconnects – the Proxy clears the handle group and sets a short invisibleTime
+     *       so the message becomes visible again quickly.</li>
+     *   <li>The receipt handle becomes invalid on the Broker side (e.g., Broker restart).</li>
+     *   <li>The cumulative renew duration exceeds {@link #renewMaxTimeMillis} (default 3 hours) –
+     *       at that point the Proxy stops renewing and triggers a retry via STOP_RENEW. A WARN log is
+     *       emitted so operators can identify stuck consumers.</li>
+     *   <li>The consecutive renew-error count reaches {@link #maxRenewRetryTimes} (default 3).</li>
+     * </ul>
+     * <b>Risk note:</b> If the consumer process is alive and the network is up but the business logic is
+     * stuck (deadlock / infinite loop), the Proxy will keep renewing invisibleTime and the message will
+     * not enter the retry queue until {@link #renewMaxTimeMillis} elapses (default 3 hours). Set
+     * {@code renewMaxTimeMillis} to a lower value if a shorter stuck-consumer detection window is needed.
+     */
     private boolean enableProxyAutoRenew = true;
+    /**
+     * Maximum consecutive renew-error count before the Proxy gives up renewing a handle and drops it.
+     * After this many consecutive failed ChangeInvisibleTime calls the handle is removed from the
+     * manager, causing the message to become visible again on the Broker once its invisibleTime expires.
+     * Default: 3.
+     */
     private int maxRenewRetryTimes = 3;
     private int renewThreadPoolNums = 2;
     private int renewMaxThreadPoolNums = 4;
     private int renewThreadPoolQueueCapacity = 300;
     private long lockTimeoutMsInHandleGroup = TimeUnit.SECONDS.toMillis(3);
+    /**
+     * How many milliseconds ahead of the invisibleTime expiry the Proxy proactively triggers a renew.
+     * The scheduler runs every {@link #renewSchedulePeriodMillis} and renews handles whose remaining
+     * invisibleTime is less than this value. Default: 10 000 ms (10 s).
+     */
     private long renewAheadTimeMillis = TimeUnit.SECONDS.toMillis(10);
+    /**
+     * Maximum total duration (in ms) that the Proxy will keep auto-renewing a single message handle,
+     * measured from the time the message was first consumed (popTime). Once this limit is reached the
+     * Proxy stops renewing and fires a STOP_RENEW event so the message enters the retry queue according
+     * to the group's retry policy. A WARN log is emitted at that point.
+     * Default: 3 hours (10 800 000 ms).
+     * Tune this value down if you need faster stuck-consumer detection.
+     */
     private long renewMaxTimeMillis = TimeUnit.HOURS.toMillis(3);
+    /**
+     * Period (in ms) at which the scheduled renewal task scans all managed handles.
+     * Default: 5 000 ms (5 s).
+     */
     private long renewSchedulePeriodMillis = TimeUnit.SECONDS.toMillis(5);
     private int returnHandleGroupThreadPoolNums = 2;
 
